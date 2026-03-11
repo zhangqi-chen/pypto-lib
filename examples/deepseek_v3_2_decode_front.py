@@ -250,8 +250,14 @@ def build_deepseek_v3_2_decode_front_program(
                     pe_lo = pl.slice(pe_row, [1, QK_ROPE_HEAD_DIM_CFG // 2], [0, 0])
                     pe_hi = pl.slice(pe_row, [1, QK_ROPE_HEAD_DIM_CFG // 2], [0, QK_ROPE_HEAD_DIM_CFG // 2])
                     pe_rot = pl.create_tensor([1, QK_ROPE_HEAD_DIM_CFG], dtype=pl.FP32)
-                    pe_rot = pl.assemble(pe_rot, pl.sub(pl.col_expand_mul(pe_lo, cos_lo), pl.col_expand_mul(pe_hi, sin_lo)), [0, 0])
-                    pe_rot = pl.assemble(pe_rot, pl.add(pl.col_expand_mul(pe_hi, cos_hi), pl.col_expand_mul(pe_lo, sin_hi)), [0, QK_ROPE_HEAD_DIM_CFG // 2])
+                    pe_lo_cos = pl.col_expand_mul(pe_lo, cos_lo)
+                    pe_hi_sin = pl.col_expand_mul(pe_hi, sin_lo)
+                    pe_rot_lo = pl.sub(pe_lo_cos, pe_hi_sin)
+                    pe_rot = pl.assemble(pe_rot, pe_rot_lo, [0, 0])
+                    pe_hi_cos = pl.col_expand_mul(pe_hi, cos_hi)
+                    pe_lo_sin = pl.col_expand_mul(pe_lo, sin_hi)
+                    pe_rot_hi = pl.add(pe_hi_cos, pe_lo_sin)
+                    pe_rot = pl.assemble(pe_rot, pe_rot_hi, [0, QK_ROPE_HEAD_DIM_CFG // 2])
                     kv_cache = pl.assemble(kv_cache, pl.cast(kv_normed, target_type=pl.BF16), [cache_row, 0])
                     pe_cache = pl.assemble(pe_cache, pl.cast(pe_rot, target_type=pl.BF16), [cache_row, 0])
 
@@ -549,9 +555,6 @@ def compile_and_run(
         ep_nodes=ep_nodes,
     )
 
-    if work_dir is None:
-        work_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "deepseek_v3_2_decode_front_dump"))
-
     result = run(
         program=program,
         tensor_specs=tensor_specs,
@@ -563,19 +566,13 @@ def compile_and_run(
             atol=2e-2,
             strategy=OptimizationStrategy.Default,
             dump_passes=dump_passes,
-            backend_type=BackendType.CCE,
-            work_dir=work_dir,
+            backend_type=BackendType.Ascend910B_PTO,
         ),
     )
     if not result.passed and result.error and "code_runner" in result.error:
         print("Result: COMPILE OK — device run skipped (code_runner not found).")
-        print("  Generated kernels/orchestration:", work_dir)
-        return result
     if not result.passed and result.error:
         print(f"Result: {result.error}")
-        print("  Pass dumps may still have been written to:", work_dir)
-    else:
-        print("  Generated kernels/orchestration:", work_dir)
     return result
 
 

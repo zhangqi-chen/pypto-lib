@@ -20,7 +20,7 @@ Design goals:
 - per-session KV cache depth up to 4096
 - fewer, larger auto_incore scopes
 - fused outer loops where practical
-- all pl.view / pl.slice of GM tensors are >= 512 B (alignment rule)
+- all pl.slice / pl.slice of GM tensors are >= 512 B (alignment rule)
 """
 
 import os
@@ -435,9 +435,6 @@ def compile_and_run(
         intermediate_size=intermediate_size,
     )
 
-    if work_dir is None:
-        work_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "qwen3_32b_decode_dump"))
-
     result = run(
         program=program,
         tensor_specs=tensor_specs,
@@ -449,19 +446,13 @@ def compile_and_run(
             atol=2e-2,
             strategy=OptimizationStrategy.Default,
             dump_passes=dump_passes,
-            backend_type=BackendType.CCE,
-            work_dir=work_dir,
+            backend_type=BackendType.Ascend910B_PTO,
         ),
     )
     if not result.passed and result.error and "code_runner" in result.error:
         print("Result: COMPILE OK — device run skipped (code_runner not found).")
-        print("  Generated kernels/orchestration:", work_dir)
-        return result
     if not result.passed and result.error:
         print(f"Result: {result.error}")
-        print("  Pass dumps may still have been written to:", work_dir)
-    else:
-        print("  Generated kernels/orchestration:", work_dir)
     return result
 
 
