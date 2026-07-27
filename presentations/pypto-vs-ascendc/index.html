@@ -1,0 +1,574 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <meta name="theme-color" content="#ffffff">
+  <title>PyPTO3.0阶段报告</title>
+  <style>
+    :root {
+      --ink: #1d2939;
+      --muted: #667085;
+      --line: #dfe3e8;
+      --soft: #f5f7fa;
+      --blue: #2563eb;
+      --blue-soft: #dbe8ff;
+      --green: #16794a;
+      --orange: #c25713;
+      --baseline: #98a2b3;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html {
+      min-width: 320px;
+      background: #fff;
+    }
+
+    body {
+      margin: 0;
+      color: var(--ink);
+      background: #fff;
+      font-family:
+        -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+        "Microsoft YaHei", Arial, sans-serif;
+      line-height: 1.65;
+    }
+
+    main {
+      width: min(980px, calc(100% - 48px));
+      margin: 0 auto;
+      padding: 58px 0 44px;
+    }
+
+    header {
+      padding-bottom: 28px;
+      border-bottom: 2px solid var(--ink);
+    }
+
+    h1,
+    h2,
+    h3,
+    p {
+      margin-top: 0;
+    }
+
+    h1 {
+      margin-bottom: 10px;
+      font-size: clamp(34px, 5vw, 48px);
+      line-height: 1.2;
+      letter-spacing: -0.035em;
+    }
+
+    .report-date {
+      margin-bottom: 0;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    section {
+      padding: 34px 0 38px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    h2 {
+      margin-bottom: 10px;
+      font-size: 26px;
+      line-height: 1.35;
+      letter-spacing: -0.02em;
+    }
+
+    .section-intro {
+      max-width: 850px;
+      margin-bottom: 24px;
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    .milestone {
+      max-width: 900px;
+      margin-bottom: 24px;
+      color: var(--blue);
+      font-size: 18px;
+      font-weight: 700;
+      line-height: 1.65;
+    }
+
+    .repo-list {
+      border-top: 1px solid var(--line);
+    }
+
+    .repo-row {
+      display: grid;
+      grid-template-columns: 190px minmax(0, 1fr);
+      gap: 22px;
+      padding: 14px 0;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .repo-row a {
+      width: fit-content;
+      color: var(--blue);
+      font-weight: 700;
+      text-decoration: none;
+    }
+
+    .repo-row a:hover,
+    .repo-row a:focus-visible {
+      text-decoration: underline;
+    }
+
+    .repo-row p {
+      margin-bottom: 0;
+      color: #344054;
+      font-size: 14px;
+    }
+
+    .loc-summary {
+      display: grid;
+      grid-template-columns: 210px minmax(0, 1fr);
+      gap: 32px;
+      align-items: center;
+      padding: 22px 0 26px;
+    }
+
+    .loc-result strong {
+      display: block;
+      margin-bottom: 4px;
+      color: var(--blue);
+      font-size: 42px;
+      line-height: 1.1;
+      letter-spacing: -0.04em;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .loc-result span {
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .bars {
+      display: grid;
+      gap: 15px;
+    }
+
+    .bar-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 18px;
+      margin-bottom: 6px;
+      color: #344054;
+      font-size: 13px;
+    }
+
+    .bar-head strong {
+      color: var(--ink);
+      font-size: 14px;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .track {
+      height: 12px;
+      overflow: hidden;
+      background: var(--soft);
+      border-radius: 2px;
+    }
+
+    .fill {
+      display: block;
+      height: 100%;
+      min-width: 3px;
+      background: var(--blue);
+      border-radius: 2px;
+    }
+
+    .fill.baseline {
+      background: var(--baseline);
+    }
+
+    table {
+      width: 100%;
+      margin-top: 10px;
+      border-collapse: collapse;
+      font-size: 13px;
+      font-variant-numeric: tabular-nums;
+    }
+
+    th,
+    td {
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--line);
+      text-align: right;
+      vertical-align: middle;
+    }
+
+    th {
+      color: var(--muted);
+      background: var(--soft);
+      font-weight: 600;
+    }
+
+    th:first-child,
+    td:first-child {
+      text-align: left;
+    }
+
+    .loc-table tbody tr:last-child {
+      font-weight: 700;
+    }
+
+    .improvement {
+      color: var(--green);
+      font-weight: 700;
+    }
+
+    .method {
+      margin: 18px 0 0;
+      padding: 12px 14px;
+      color: var(--muted);
+      background: var(--soft);
+      border-left: 3px solid #cbd5e1;
+      font-size: 12px;
+      line-height: 1.7;
+    }
+
+    .network-list {
+      border-top: 1px solid var(--line);
+    }
+
+    .network {
+      padding: 24px 0 10px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .network h3 {
+      margin-bottom: 12px;
+      font-size: 20px;
+      line-height: 1.4;
+    }
+
+    .perf-type {
+      width: 210px;
+      color: #344054;
+      font-weight: 700;
+      vertical-align: top;
+    }
+
+    .row-note {
+      display: block;
+      margin-top: 2px;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 400;
+      white-space: normal;
+    }
+
+    .perf-table-wrap {
+      min-width: 0;
+      overflow-x: auto;
+    }
+
+    .perf-table {
+      min-width: 720px;
+      margin-top: 0;
+    }
+
+    .perf-table .metric {
+      text-align: left;
+    }
+
+    .ratio-good,
+    .ratio-warn {
+      display: inline-block;
+      min-width: 54px;
+      font-weight: 750;
+      text-align: center;
+    }
+
+    .ratio-good {
+      color: var(--green);
+    }
+
+    .ratio-warn {
+      color: var(--orange);
+    }
+
+    footer {
+      padding-top: 20px;
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.7;
+    }
+
+    footer p {
+      margin-bottom: 4px;
+    }
+
+    @media (max-width: 720px) {
+      main {
+        width: min(100% - 30px, 980px);
+        padding-top: 32px;
+      }
+
+      .repo-row,
+      .loc-summary {
+        grid-template-columns: 1fr;
+        gap: 8px;
+      }
+
+      .loc-summary {
+        gap: 20px;
+      }
+
+      th,
+      td {
+        padding: 8px 7px;
+      }
+    }
+
+    @media print {
+      main {
+        width: 100%;
+        padding: 0;
+      }
+
+      section,
+      .network,
+      .repo-row {
+        break-inside: avoid;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>PyPTO3.0阶段报告</h1>
+      <p class="report-date">2026年7月</p>
+    </header>
+
+    <section>
+      <p class="milestone">
+        PyPTO 3.0 已完成 6 仓协同的全栈能力建设，在 A2/A3 打通 Qwen3-14B 与
+        DeepSeek-V4 Flash 端到端推理链路，实现 Token 推理生成，且性能与 AscendC 相当。
+      </p>
+      <h2>1. PyPTO3.0 Repos</h2>
+
+      <div class="repo-list">
+        <div class="repo-row">
+          <a href="https://github.com/hw-native-sys/pypto-serving" target="_blank" rel="noopener noreferrer">pypto-serving</a>
+          <p>推理服务层，提供 OpenAI 兼容接口、模型加载、请求调度、Batching、KV Cache、采样与 NPU Worker。</p>
+        </div>
+        <div class="repo-row">
+          <a href="https://github.com/hw-native-sys/pypto-lib" target="_blank" rel="noopener noreferrer">pypto-lib</a>
+          <p>模型与算子库，基于 PyPTO DSL 实现可复用张量算子及 Qwen、DeepSeek 等端到端模型 Kernel。</p>
+        </div>
+        <div class="repo-row">
+          <a href="https://github.com/hw-native-sys/pypto" target="_blank" rel="noopener noreferrer">pypto</a>
+          <p>编程框架与核心编译器，通过 Python Tensor/Tile DSL、多级 IR、编译 Pass 和 CodeGen 生成设备可执行代码。</p>
+        </div>
+        <div class="repo-row">
+          <a href="https://github.com/hw-native-sys/simpler" target="_blank" rel="noopener noreferrer">simpler</a>
+          <p>任务运行时，构建并执行任务依赖图，协调 Host、AICPU 与 AICore 的调度、内存和同步。</p>
+        </div>
+        <div class="repo-row">
+          <a href="https://github.com/hw-native-sys/PTOAS" target="_blank" rel="noopener noreferrer">PTOAS</a>
+          <p>汇编与优化器，基于 LLVM/MLIR 解析、校验并优化 .pto，生成调用 PTO-ISA 的 C++ Kernel。</p>
+        </div>
+        <div class="repo-row">
+          <a href="https://github.com/hw-native-sys/pto-isa" target="_blank" rel="noopener noreferrer">PTO-ISA</a>
+          <p>Tile 虚拟指令集，定义并实现跨 A2/A3/A5 的标准计算、搬运、同步和通信指令，统一底层硬件接口。</p>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>2. 生产算子代码量对比</h2>
+      <p class="section-intro">
+        选取 DeepSeek-V4 Flash W8A8 Attention 链路中四组可一一对应的生产算子。
+        PyPTO 用更少的代码表达计算与调度，便于组合、修改和快速迭代。
+      </p>
+
+      <div class="loc-summary">
+        <div class="loc-result">
+          <strong>−87.8%</strong>
+          <span>PyPTO 生产算子代码量</span>
+        </div>
+        <div class="bars" aria-label="生产算子代码量总计">
+          <div>
+            <div class="bar-head">
+              <span>PyPTO</span>
+              <strong>2,439 LOC</strong>
+            </div>
+            <div class="track"><span class="fill" style="width: 12.2%"></span></div>
+          </div>
+          <div>
+            <div class="bar-head">
+              <span>AscendC</span>
+              <strong>19,970 LOC</strong>
+            </div>
+            <div class="track"><span class="fill baseline" style="width: 100%"></span></div>
+          </div>
+        </div>
+      </div>
+
+      <table class="loc-table">
+        <thead>
+          <tr>
+            <th>对应算子组</th>
+            <th>PyPTO</th>
+            <th>AscendC</th>
+            <th>PyPTO 代码量减少</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>HC Pre</td>
+            <td>418</td>
+            <td>2,083</td>
+            <td class="improvement">79.9%</td>
+          </tr>
+          <tr>
+            <td>Compressor</td>
+            <td>440</td>
+            <td>7,158</td>
+            <td class="improvement">93.9%</td>
+          </tr>
+          <tr>
+            <td>Indexer</td>
+            <td>515</td>
+            <td>3,311</td>
+            <td class="improvement">84.4%</td>
+          </tr>
+          <tr>
+            <td>Sparse Attention</td>
+            <td>1,066</td>
+            <td>7,418</td>
+            <td class="improvement">85.6%</td>
+          </tr>
+          <tr>
+            <td>合计</td>
+            <td>2,439</td>
+            <td>19,970</td>
+            <td class="improvement">87.8%</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <p class="method">
+        统计口径：仅统计算子实现代码。
+      </p>
+    </section>
+
+    <section>
+      <h2>3. Qwen 和 DeepSeek 性能 (A3)</h2>
+
+      <div class="network-list">
+        <article class="network">
+          <h3>Qwen3-14B</h3>
+          <div class="perf-table-wrap">
+            <table class="perf-table">
+              <thead>
+                <tr>
+                  <th>类型</th>
+                  <th class="metric">算子 / 指标</th>
+                  <th>PyPTO</th>
+                  <th>AscendC</th>
+                  <th>PyPTO / AscendC</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td class="perf-type">算子性能<span class="row-note">BS=8，SeqLen=3.5K</span></td>
+                  <td class="metric">Decode Layer</td>
+                  <td>908 μs</td>
+                  <td>885 μs</td>
+                  <td><span class="ratio-warn">1.026</span></td>
+                </tr>
+                <tr>
+                  <td class="perf-type">推理性能<span class="row-note">单 Die，BS=16，SeqLen=128，Output=1024</span></td>
+                  <td class="metric">TPOT</td>
+                  <td>30.1 ms</td>
+                  <td>29.9 ms</td>
+                  <td><span class="ratio-warn">1.007</span></td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </article>
+
+        <article class="network">
+          <h3>DeepSeek-V4 Flash W8A8</h3>
+          <div class="perf-table-wrap">
+            <table class="perf-table">
+              <thead>
+                <tr>
+                  <th>类型</th>
+                  <th class="metric">算子 / 指标</th>
+                  <th>PyPTO</th>
+                  <th>AscendC</th>
+                  <th>PyPTO / AscendC</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td class="perf-type" rowspan="5">
+                    算子性能
+                    <span class="row-note">TP=1，DP=EP=16，GBS=16×4，SeqLen=8K，MTP=1，eplb</span>
+                  </td>
+                  <td class="metric">Attention CSA</td>
+                  <td>363 μs</td>
+                  <td>465 μs</td>
+                  <td><span class="ratio-good">0.781</span></td>
+                </tr>
+                <tr>
+                  <td class="metric">Attention HCA</td>
+                  <td>271 μs</td>
+                  <td>307 μs</td>
+                  <td><span class="ratio-good">0.883</span></td>
+                </tr>
+                <tr>
+                  <td class="metric">Attention SWA</td>
+                  <td>246 μs</td>
+                  <td>280 μs</td>
+                  <td><span class="ratio-good">0.879</span></td>
+                </tr>
+                <tr>
+                  <td class="metric">MoE</td>
+                  <td>497 μs</td>
+                  <td>479 μs</td>
+                  <td><span class="ratio-warn">1.038</span></td>
+                </tr>
+                <tr>
+                  <td class="metric">43 层 Decode</td>
+                  <td>35.5 ms</td>
+                  <td>37.2 ms</td>
+                  <td><span class="ratio-good">0.954</span></td>
+                </tr>
+                <tr>
+                  <td class="perf-type">
+                    推理性能
+                    <span class="row-note">TP=1，DP=EP=16，LM Head TP=4，GBS=16×4，SeqLen=8K，MTP=1，eplb</span>
+                  </td>
+                  <td class="metric">TPOT</td>
+                  <td>118 ms<span class="row-note">DP=EP=8，GBS=8×4</span></td>
+                  <td>51 ms</td>
+                  <td><span class="ratio-warn">2.314</span></td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </article>
+      </div>
+
+    </section>
+
+    <footer>
+      <p>代码统计快照：cann-recipes-infer 8a0c48e、ops-transformer f2b52addb、ops-nn db019c899；性能数据由项目实测提供。</p>
+    </footer>
+  </main>
+</body>
+</html>
