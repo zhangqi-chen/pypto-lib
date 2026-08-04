@@ -515,7 +515,7 @@
               </thead>
               <tbody>
                 <tr>
-                  <td class="perf-type" rowspan="5">
+                  <td class="perf-type" rowspan="6">
                     算子性能
                     <span class="row-note">TP=1，DP=EP=16，GBS=16×4，SeqLen=8K，MTP=1，eplb</span>
                   </td>
@@ -543,10 +543,16 @@
                   <td><span class="ratio-good">0.996</span></td>
                 </tr>
                 <tr>
-                  <td class="metric">43 层 Decode</td>
-                  <td>35.6 ms</td>
-                  <td>37.2 ms</td>
-                  <td><span class="ratio-good">0.957</span></td>
+                  <td class="metric">Decode Main</td>
+                  <td>36.1 ms</td>
+                  <td>37.7 ms</td>
+                  <td><span class="ratio-good">0.958</span></td>
+                </tr>
+                <tr>
+                  <td class="metric">Decode MTP</td>
+                  <td>1162 μs</td>
+                  <td>1268 μs</td>
+                  <td><span class="ratio-good">0.916</span></td>
                 </tr>
                 <tr>
                   <td class="perf-type">
@@ -554,9 +560,9 @@
                     <span class="row-note">TP=1，DP=EP=16，LM Head TP=4，GBS=16×4，SeqLen=8K，MTP=1，eplb</span>
                   </td>
                   <td class="metric">TPOT</td>
-                  <td>118 ms<span class="row-note">DP=EP=8，GBS=8×4</span></td>
-                  <td>51 ms</td>
-                  <td><span class="ratio-warn">2.314</span></td>
+                  <td>55.9 ms<span class="row-note">实测 EP=8 为 51 ms，算子占 32.4 ms</span></td>
+                  <td>51.0 ms</td>
+                  <td><span class="ratio-warn">1.096</span></td>
                 </tr>
               </tbody>
             </table>
