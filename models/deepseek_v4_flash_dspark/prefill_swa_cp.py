@@ -6,13 +6,38 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""DeepSeek-V4 context-parallel prefill SWA: one rank's token slice, KV fully replicated."""
+# ci: devices=2  # CI: 2-card run; borrows 2 cards via task-submit --device-num
+"""DeepSeek-V4 context-parallel prefill SWA: one rank's token slice, KV fully replicated.
+--cp picks the CP world size: 2 or 4 ranks over the same token run."""
+
+
+# T_LOC freezes into the kernel shapes at import time, so read --cp from argv and
+# override config before importing the sub-kernels below.
+import sys
+
+import config
+
+_CP_CHOICES = (2, 4)
+_CP_DEFAULT = 2
+
+
+def _parse_cp_argv():
+    for i, tok in enumerate(sys.argv):
+        if tok == "--cp" and i + 1 < len(sys.argv):
+            return int(sys.argv[i + 1])
+        if tok.startswith("--cp="):
+            return int(tok.split("=", 1)[1])
+    return _CP_DEFAULT
+
+
+CP = _parse_cp_argv()
+config.CP = CP
 
 import pypto.language as pl
+import pypto.language.distributed as pld
 
 from config import (
     BLOCK_SIZE,
-    CP,
     FLASH as M,
     INT8_AMAX_EPS,
     INT8_SCALE_MAX,
@@ -76,14 +101,18 @@ CMP_BLOCK_NUM = PREFILL_CMP_BLOCK_NUM
 SPARSE_CMP_MAX_BLOCKS = PREFILL_CMP_MAX_BLOCKS
 START_POS = 0
 
+# tiling
+GATHER_ROW_TILE = 8   # x_normed all-gather publish / stage-out row block
+
+assert CP in _CP_CHOICES, f"--cp must be one of {_CP_CHOICES} (got {CP})"
 assert WIN == BLOCK_SIZE, "SWA prefill currently assumes one window page per batch"
 assert T_LOC % 16 == 0, "cube M and the bias token tile both need a 16-row multiple"
 
 
+
 @pl.jit.inline
-def prefill_attention_swa_cp(
+def prefill_swa_cp(
     x_hc: pl.Tensor[[T_LOC, HC_MULT, D], pl.FP32],
-    x_normed_full: pl.Tensor[[T, D], pl.BF16],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
     hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
@@ -105,24 +134,51 @@ def prefill_attention_swa_cp(
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
+    x_norm_window: pld.DistributedTensor[[T, D], pl.BF16],
+    ready: pld.DistributedTensor[[CP, 1], pl.INT32],
     x_out: pl.Out[pl.Tensor[[T_LOC, HC_MULT, D], pl.FP32]],
     num_tokens_full: pl.Scalar[pl.INT32],
     num_tokens_local: pl.Scalar[pl.INT32],
+    my_rank: pl.Scalar[pl.INT32],
 ):
-    # hc_pre -> q branch on T_LOC rows / kv branch on T rows -> KV writeback ->
-    # SWA attention/o_proj on T_LOC rows -> hc_post.
+    """One CP rank: hc_pre and rms_norm over its token slice, all-gather the normalized
+    run, then q on the local rows and kv plus KV writeback on the full run."""
     x_mixed = pl.create_tensor([T_LOC, D], dtype=pl.BF16)
     post = pl.create_tensor([T_LOC, HC_MULT], dtype=pl.FP32)
     comb = pl.create_tensor([T_LOC, HC_MULT * HC_MULT], dtype=pl.FP32)
     hc_pre(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, x_mixed, post, comb)
 
-    # x_normed_full is the all_gather of every rank's x_normed_local; this rank still
-    # normalizes its own slice, which is the chunk it would contribute to that gather.
     x_normed_local = pl.create_tensor([T_LOC, D], dtype=pl.BF16)
     rms_tid = rms_norm(x_mixed, attn_norm_w, x_normed_local)
     # Defers kv_proj_matmul one hop behind rms_norm so qr_proj_matmul dispatches first.
     late_dep = pl.system.task_dummy(deps=[rms_tid])
 
+    # All-gather the normalized slices. Carries BF16 [T_LOC, D] rather than the pre-hc
+    # FP32 lanes, which are 32x larger.
+    publish_row = my_rank * T_LOC
+    x_normed_full = pl.create_tensor([T, D], dtype=pl.BF16)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_x_normed_gather"):
+        for peer in pl.range(CP):
+            pld.tensor.put(
+                dst=x_norm_window, peer=peer, src=x_normed_local,
+                dst_offsets=[publish_row, 0], src_offsets=[0, 0], shape=[T_LOC, D],
+                chunk_rows=GATHER_ROW_TILE, chunk_cols=D, pipeline=True,
+            )
+        for peer in pl.range(CP):
+            if peer != my_rank:
+                pld.system.notify(
+                    target=ready, peer=peer, offsets=[my_rank, 0],
+                    value=1, op=pld.NotifyOp.AtomicAdd,
+                )
+        for src in pl.range(CP):
+            if src != my_rank:
+                pld.system.wait(signal=ready, offsets=[src, 0], expected=1, cmp=pld.WaitCmp.Ge)
+
+        for t0 in pl.range(0, T, GATHER_ROW_TILE):
+            x_normed_full[t0 : t0 + GATHER_ROW_TILE, 0:D] = x_norm_window[t0 : t0 + GATHER_ROW_TILE, 0:D]
+
+    # q branch on T_LOC rows / kv branch on T rows -> KV writeback ->
+    # SWA attention/o_proj on T_LOC rows -> hc_post.
     # q branch: local rows, rope rows at this rank's global absolute positions.
     rope_cos_loc = pl.create_tensor([T_LOC, ROPE_HEAD_DIM], dtype=pl.BF16)
     rope_sin_loc = pl.create_tensor([T_LOC, ROPE_HEAD_DIM], dtype=pl.BF16)
@@ -210,13 +266,11 @@ def prefill_attention_swa_cp(
     )
 
     hc_post_prefill(attn_out, x_hc, post, comb, x_out, num_tokens_local)
-    return kv_cache, x_out
 
 
 @pl.jit
-def prefill_attention_swa_cp_test(
+def l2_prefill_swa_cp(
     x_hc: pl.Tensor[[T_LOC, HC_MULT, D], pl.FP32],
-    x_normed_full: pl.Tensor[[T, D], pl.BF16],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
     hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
@@ -238,21 +292,75 @@ def prefill_attention_swa_cp_test(
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
+    x_norm_window: pld.DistributedTensor[[T, D], pl.BF16],
+    ready: pld.DistributedTensor[[CP, 1], pl.INT32],
     x_out: pl.Out[pl.Tensor[[T_LOC, HC_MULT, D], pl.FP32]],
     num_tokens_full: pl.Scalar[pl.INT32],
     num_tokens_local: pl.Scalar[pl.INT32],
+    my_rank: pl.Scalar[pl.INT32],
 ):
-    prefill_attention_swa_cp(
-        x_hc, x_normed_full,
+    prefill_swa_cp(
+        x_hc,
         hc_attn_fn, hc_attn_scale, hc_attn_base,
         attn_norm_w, wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
         freqs_cos, freqs_sin,
         kv_cache, block_table, ori_slot_mapping,
         position_ids, position_ids_local,
         attn_sink, wo_a, wo_b, wo_b_scale,
-        x_out, num_tokens_full, num_tokens_local,
+        x_norm_window, ready,
+        x_out, num_tokens_full, num_tokens_local, my_rank,
     )
     return kv_cache, x_out
+
+
+@pl.jit.host
+def l3_prefill_swa_cp(
+    x_hc: pl.Tensor[[CP, T_LOC, HC_MULT, D], pl.FP32],
+    hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    hc_attn_scale: pl.Tensor[[3], pl.FP32],
+    hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
+    attn_norm_w: pl.Tensor[[D], pl.BF16],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
+    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
+    wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
+    wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
+    gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
+    gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    kv_cache: pl.InOut[pl.Tensor[[CP, BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
+    block_table: pl.Tensor[[BLOCK_NUM], pl.INT32],
+    ori_slot_mapping: pl.Tensor[[T], pl.INT64],
+    position_ids: pl.Tensor[[T], pl.INT32],
+    position_ids_local: pl.Tensor[[CP, T_LOC], pl.INT32],
+    attn_sink: pl.Tensor[[H], pl.FP32],
+    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
+    wo_b_scale: pl.Tensor[[D], pl.FP32],
+    x_out: pl.Out[pl.Tensor[[CP, T_LOC, HC_MULT, D], pl.FP32]],
+    num_tokens_full: pl.Scalar[pl.INT32],
+    num_tokens_local: pl.Scalar[pl.INT32],
+):
+    """Launch one CP rank per device. Weights and the global token metadata are shared;
+    the token slice, its positions, the output and the kv_cache copy are per rank."""
+    window_buf = pld.alloc_window_buffer([T, D], dtype=pl.BF16)
+    ready_buf = pld.alloc_window_buffer([CP, 1], dtype=pl.INT32)
+
+    for rank in pl.range(pld.world_size()):
+        x_norm_window = pld.window(window_buf, [T, D], dtype=pl.BF16)
+        ready = pld.window(ready_buf, [CP, 1], dtype=pl.INT32)
+        l2_prefill_swa_cp(
+            x_hc[rank],
+            hc_attn_fn, hc_attn_scale, hc_attn_base,
+            attn_norm_w, wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
+            freqs_cos, freqs_sin,
+            kv_cache[rank], block_table, ori_slot_mapping,
+            position_ids, position_ids_local[rank],
+            attn_sink, wo_a, wo_b, wo_b_scale,
+            x_norm_window, ready,
+            x_out[rank], num_tokens_full, num_tokens_local, rank,
+            device=rank,
+        )
 
 
 def _quant_w_per_output_channel(w):
@@ -267,15 +375,17 @@ def _quant_w_per_output_channel(w):
     return w_i8, (1.0 / scale_quant).float()
 
 
-def golden_prefill_attention_swa_cp(tensors):
-    """Torch reference: q on this rank's token slice, kv and KV writeback on the full run."""
+def _golden_swa_cp_rank(tensors, x_hc_local, position_ids_local, kv_cache_in, x_normed_full):
+    """Torch reference for one rank: q on its token slice, kv and writeback on the full run.
+
+    Returns this rank's ``x_out`` slice; ``kv_cache_in`` is updated in place.
+    """
     import torch
 
     from utils import cache_row_from_table
 
     num_tokens_full = int(tensors["num_tokens_full"])
     num_tokens_local = int(tensors["num_tokens_local"])
-    x_hc_local = tensors["x_hc"].view(T_LOC, HC_MULT, D)
 
     x_mixed = torch.zeros(T_LOC, D, dtype=torch.bfloat16)
     post = torch.zeros(T_LOC, HC_MULT, dtype=torch.float32)
@@ -291,7 +401,7 @@ def golden_prefill_attention_swa_cp(tensors):
     })
     x_normed_local = golden_rms_norm(x_mixed, tensors["attn_norm_w"])
 
-    positions_local = tensors["position_ids_local"].to(torch.long)
+    positions_local = position_ids_local.to(torch.long)
     rope_cos_loc = tensors["freqs_cos"].index_select(0, positions_local).contiguous()
     rope_sin_loc = tensors["freqs_sin"].index_select(0, positions_local).contiguous()
     q = torch.zeros(T_LOC, H, HEAD_DIM, dtype=torch.bfloat16)
@@ -322,7 +432,7 @@ def golden_prefill_attention_swa_cp(tensors):
     qr_full = torch.zeros(T, Q_LORA, dtype=torch.int8)
     qr_scale_full = torch.zeros(T, 1, dtype=torch.float32)
     golden_qkv_proj_rope({
-        "x": tensors["x_normed_full"],
+        "x": x_normed_full,
         "wq_a": tensors["wq_a"],
         "wq_b": tensors["wq_b"],
         "wq_b_scale": tensors["wq_b_scale"],
@@ -337,7 +447,6 @@ def golden_prefill_attention_swa_cp(tensors):
         "qr_scale": qr_scale_full,
     })
 
-    kv_cache_in = tensors["kv_cache"].clone()
     kv_cache_flat = kv_cache_in.view(kv_cache_in.shape[0] * BLOCK_SIZE, HEAD_DIM)
     for t in range(num_tokens_full):
         dst_row = int(tensors["ori_slot_mapping"][t].item())
@@ -346,7 +455,7 @@ def golden_prefill_attention_swa_cp(tensors):
 
     def build_swa_metadata():
         idx = torch.full((T_LOC, WIN), -1, dtype=torch.int32)
-        pos = tensors["position_ids_local"]
+        pos = position_ids_local
         table = tensors["block_table"]
         for t in range(num_tokens_local):
             abs_pos = int(pos[t].item())
@@ -376,8 +485,6 @@ def golden_prefill_attention_swa_cp(tensors):
         "attn_out": attn_out,
     })
 
-    tensors["kv_cache"][:] = kv_cache_in
-
     y = torch.zeros(T_LOC, HC_MULT, D, dtype=torch.float32)
     golden_hc_post_prefill({
         "x": attn_out.view(T_LOC, D),
@@ -387,16 +494,52 @@ def golden_prefill_attention_swa_cp(tensors):
         "y": y,
         "num_tokens": tensors["num_tokens_local"],
     })
-    tensors["x_out"][:] = y
+    return y
 
 
-def build_tensor_specs(rank: int = 0, start_pos: int = START_POS, num_tokens: int = T):
+def _golden_local_norm(tensors, x_hc_local):
+    """hc_pre + rms_norm over one rank's slice, the chunk it contributes to the gather."""
+    import torch
+
+    x_mixed = torch.zeros(T_LOC, D, dtype=torch.bfloat16)
+    post = torch.zeros(T_LOC, HC_MULT, dtype=torch.float32)
+    comb = torch.zeros(T_LOC, HC_MULT * HC_MULT, dtype=torch.float32)
+    golden_hc_pre({
+        "x": x_hc_local,
+        "hc_fn": tensors["hc_attn_fn"],
+        "hc_scale": tensors["hc_attn_scale"],
+        "hc_base": tensors["hc_attn_base"],
+        "x_mixed": x_mixed,
+        "post": post,
+        "comb": comb,
+    })
+    return golden_rms_norm(x_mixed, tensors["attn_norm_w"])
+
+
+def golden_prefill_swa_cp(tensors):
+    """Torch reference: the all_gather is the rank-ordered concat of the local norms."""
+    import torch
+
+    slices = [_golden_local_norm(tensors, tensors["x_hc"][rank].view(T_LOC, HC_MULT, D)) for rank in range(CP)]
+    x_normed_full = torch.cat(slices, dim=0).to(torch.bfloat16)
+    for rank in range(CP):
+        kv_cache_in = tensors["kv_cache"][rank].clone()
+        x_hc_local = tensors["x_hc"][rank].view(T_LOC, HC_MULT, D)
+        y = _golden_swa_cp_rank(
+            tensors, x_hc_local, tensors["position_ids_local"][rank], kv_cache_in, x_normed_full,
+        )
+        tensors["kv_cache"][rank] = kv_cache_in
+        tensors["x_out"][rank] = y
+
+
+def build_tensor_specs(start_pos: int = START_POS, num_tokens: int = T):
+    """Every rank's slice stacked on a leading CP axis."""
     import torch
     from golden import ScalarSpec, TensorSpec
     from utils import build_rope_tables, cache_row_from_table, quant_w_per_channel
 
-    if not 0 <= rank < CP:
-        raise ValueError(f"rank must be in [0, {CP}), got {rank}")
+    if num_tokens != T:
+        raise ValueError(f"every slice must be active: num_tokens must be {T}")
     if num_tokens <= 0 or num_tokens > T:
         raise ValueError(f"num_tokens must be in [1, {T}], got {num_tokens}")
     context_len = start_pos
@@ -406,8 +549,7 @@ def build_tensor_specs(rank: int = 0, start_pos: int = START_POS, num_tokens: in
     if max_position > MAX_SEQ_LEN:
         raise ValueError(f"position_ids exceed MAX_SEQ_LEN={MAX_SEQ_LEN}: got {max_position}")
 
-    local_start = rank * T_LOC
-    num_tokens_local = max(0, min(T_LOC, num_tokens - local_start))
+    num_tokens_local = T_LOC
     shared_freqs_cos, shared_freqs_sin = build_rope_tables(M, 0, dtype=torch.bfloat16)
 
     def token_pos():
@@ -460,7 +602,8 @@ def build_tensor_specs(rank: int = 0, start_pos: int = START_POS, num_tokens: in
             value = (torch.rand(HEAD_DIM,) - 0.5) * 0.1
             if row >= 0:
                 cache_flat[row] = value.to(torch.bfloat16)
-        return cache
+        # Every rank starts from the same replicated cache.
+        return cache.expand(CP, *cache.shape).contiguous()
     def init_ori_slot_mapping():
         mapping = torch.full((T,), -1, dtype=torch.int64)
         pos = token_pos()
@@ -469,27 +612,12 @@ def build_tensor_specs(rank: int = 0, start_pos: int = START_POS, num_tokens: in
             mapping[t] = cache_row_from_table(table, int(pos[t].item()))
         return mapping
 
-    # x_normed_full stands in for the all_gather result: hc_pre + rms_norm over the whole
-    # token run, of which this rank's slice is rows [local_start, local_start + T_LOC).
     x_hc_full = init_x_hc_full()
     attn_norm_w = init_attn_norm_w().to(torch.bfloat16)
-    x_mixed_full = torch.zeros(T, D, dtype=torch.bfloat16)
-    post_full = torch.zeros(T, HC_MULT, dtype=torch.float32)
-    comb_full = torch.zeros(T, HC_MULT * HC_MULT, dtype=torch.float32)
-    golden_hc_pre({
-        "x": x_hc_full,
-        "hc_fn": init_hc_attn_fn(),
-        "hc_scale": init_hc_attn_scale(),
-        "hc_base": init_hc_attn_base(),
-        "x_mixed": x_mixed_full,
-        "post": post_full,
-        "comb": comb_full,
-    })
-    x_normed_full = golden_rms_norm(x_mixed_full, attn_norm_w).to(torch.bfloat16)
 
     position_ids = token_pos()
-    x_hc_local = x_hc_full[local_start : local_start + T_LOC].contiguous()
-    position_ids_local = position_ids[local_start : local_start + T_LOC].contiguous()
+    x_hc_local = x_hc_full.view(CP, T_LOC, HC_MULT, D).contiguous()
+    position_ids_local = position_ids.view(CP, T_LOC).contiguous()
 
     wq_b_bf16 = init_wq_b().to(torch.bfloat16)
     wq_b_i8, wq_b_scale = _quant_w_per_output_channel(wq_b_bf16)
@@ -497,8 +625,7 @@ def build_tensor_specs(rank: int = 0, start_pos: int = START_POS, num_tokens: in
     wo_b_i8, wo_b_scale = quant_w_per_channel(wo_b_bf16)
 
     return num_tokens_local, [
-        TensorSpec("x_hc", [T_LOC, HC_MULT, D], torch.float32, init_value=lambda: x_hc_local),
-        TensorSpec("x_normed_full", [T, D], torch.bfloat16, init_value=lambda: x_normed_full),
+        TensorSpec("x_hc", [CP] + [T_LOC, HC_MULT, D], torch.float32, init_value=lambda: x_hc_local),
         TensorSpec("hc_attn_fn", [MIX_HC, HC_DIM], torch.float32, init_value=init_hc_attn_fn),
         TensorSpec("hc_attn_scale", [3], torch.float32, init_value=init_hc_attn_scale),
         TensorSpec("hc_attn_base", [MIX_HC], torch.float32, init_value=init_hc_attn_base),
@@ -511,74 +638,113 @@ def build_tensor_specs(rank: int = 0, start_pos: int = START_POS, num_tokens: in
         TensorSpec("gamma_ckv", [HEAD_DIM], torch.bfloat16, init_value=lambda: torch.ones(HEAD_DIM)),
         TensorSpec("freqs_cos", [MAX_SEQ_LEN, ROPE_HEAD_DIM], torch.bfloat16, init_value=shared_freqs_cos.clone),
         TensorSpec("freqs_sin", [MAX_SEQ_LEN, ROPE_HEAD_DIM], torch.bfloat16, init_value=shared_freqs_sin.clone),
-        TensorSpec("kv_cache", [BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16,
+        TensorSpec("kv_cache", [CP] + [BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16,
                    init_value=init_kv_cache, is_output=True),
         TensorSpec("block_table", [BLOCK_NUM], torch.int32, init_value=init_block_table),
         TensorSpec("ori_slot_mapping", [T], torch.int64, init_value=init_ori_slot_mapping),
         TensorSpec("position_ids", [T], torch.int32, init_value=lambda: position_ids),
-        TensorSpec("position_ids_local", [T_LOC], torch.int32, init_value=lambda: position_ids_local),
+        TensorSpec("position_ids_local", [CP] + [T_LOC], torch.int32, init_value=lambda: position_ids_local),
         TensorSpec("attn_sink", [H], torch.float32, init_value=lambda: torch.zeros(H)),
         TensorSpec("wo_a", [O_GROUPS, O_LORA, O_GROUP_IN], torch.bfloat16,
                    init_value=lambda: (torch.rand(O_GROUPS, O_LORA, O_GROUP_IN) - 0.5) * O_GROUP_IN ** -0.5),
         TensorSpec("wo_b", [D, O_GROUPS * O_LORA], torch.int8, init_value=lambda: wo_b_i8),
         TensorSpec("wo_b_scale", [D], torch.float32, init_value=lambda: wo_b_scale),
-        TensorSpec("x_out", [T_LOC, HC_MULT, D], torch.float32, is_output=True),
+        TensorSpec("x_out", [CP] + [T_LOC, HC_MULT, D], torch.float32, is_output=True),
         ScalarSpec("num_tokens_full", torch.int32, num_tokens),
         ScalarSpec("num_tokens_local", torch.int32, num_tokens_local),
     ]
 
 
-def valid_ratio_reldiff(num_tokens: int, diff_thd: float, pct_thd: float, max_diff_hd: float):
-    """Relative-diff comparator over the leading ``num_tokens`` rows; zero padding sliced off."""
+def cp_valid_ratio_reldiff(num_tokens: int, diff_thd: float, pct_thd: float, max_diff_hd: float):
+    """Relative-diff comparator over each rank's leading ``num_tokens`` rows."""
     from golden import ratio_reldiff
 
     base_cmp = ratio_reldiff(diff_thd=diff_thd, pct_thd=pct_thd, max_diff_hd=max_diff_hd)
+    token_axis = 1
 
     def cmp(actual, expected, *, actual_outputs, expected_outputs, inputs, rtol, atol):
-        tail_nonzero = int(actual[num_tokens:].count_nonzero().item())
+        tail_actual = actual.narrow(token_axis, num_tokens, actual.shape[token_axis] - num_tokens)
+        tail_nonzero = int(tail_actual.count_nonzero().item())
         if tail_nonzero:
             return False, f"    inactive x_out tail contains {tail_nonzero} nonzero values"
         return base_cmp(
-            actual[:num_tokens], expected[:num_tokens],
+            actual.narrow(token_axis, 0, num_tokens), expected.narrow(token_axis, 0, num_tokens),
             actual_outputs=actual_outputs, expected_outputs=expected_outputs,
             inputs=inputs, rtol=rtol, atol=atol,
         )
 
-    cmp.__name__ = f"valid_ratio_reldiff(num_tokens={num_tokens})"
+    cmp.__name__ = f"cp_valid_ratio_reldiff(num_tokens={num_tokens})"
+    return cmp
+
+
+def cp_replica_allclose(atol: float, rtol: float):
+    """kv_cache comparator: the CP copies agree with each other, then match the reference.
+
+    kv_proj accumulates its split-K partials with FP32 atomic adds, so the completion order
+    -- and with it the last bf16 bit -- is not reproducible across cards. The replicas are
+    therefore held to the same bar as the reference comparison rather than to bit equality.
+    """
+    from golden import ratio_allclose
+
+    base_cmp = ratio_allclose(atol=atol, rtol=rtol)
+
+    def cmp(actual, expected, *, actual_outputs, expected_outputs, inputs, rtol, atol):
+        for replica in range(1, actual.shape[0]):
+            same, detail = base_cmp(
+                actual[replica], actual[0],
+                actual_outputs=actual_outputs, expected_outputs=expected_outputs,
+                inputs=inputs, rtol=rtol, atol=atol,
+            )
+            if not same:
+                return False, f"    kv_cache replica {replica} diverges from replica 0:\n{detail}"
+        return base_cmp(
+            actual, expected,
+            actual_outputs=actual_outputs, expected_outputs=expected_outputs,
+            inputs=inputs, rtol=rtol, atol=atol,
+        )
+
+    cmp.__name__ = f"cp_replica_allclose(replicas={CP})"
     return cmp
 
 
 if __name__ == "__main__":
     import argparse
-    from golden import ratio_allclose, run_jit
+    from pypto.ir.distributed_compiled_program import DistributedConfig
 
-    parser = argparse.ArgumentParser(description="Single-rank DeepSeek V4 context-parallel prefill SWA test.")
+    from golden import run_jit
+
+    parser = argparse.ArgumentParser(description="DeepSeek V4 context-parallel prefill SWA test.")
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
-    parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--rank", type=int, default=0, choices=list(range(CP)),
-                        help="CP rank whose token slice is computed; ranks > 0 look back across the slice edge.")
+    parser.add_argument("-d", "--device", type=str, default=",".join(str(i) for i in range(CP)),
+                        help="Comma-separated device ids; at least CP of them.")
+    parser.add_argument("--cp", type=int, default=_CP_DEFAULT, choices=list(_CP_CHOICES),
+                        help="CP world size; read from argv at import time to freeze the shapes.")
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--start-pos", type=int, default=START_POS,
                         help="context_len (multiple of WIN); fixture-only, lowered into token metadata.")
-    parser.add_argument("--num-tokens", type=int, default=T,
-                        help="Active token count over the whole run, capped by T.")
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     parser.add_argument("--enable-dep-gen", action="store_true", default=False)
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
 
-    compare_tokens, specs = build_tensor_specs(args.rank, args.start_pos, args.num_tokens)
-    print(f"--- prefill_swa_cp rank={args.rank}/{CP}: local rows={T_LOC}, active={compare_tokens}, full={T} ---")
+    device_ids = [int(device) for device in args.device.split(",")]
+    if len(device_ids) < CP:
+        raise SystemExit(f"CP{CP} needs {CP} devices, got {device_ids}")
+
+    compare_tokens, specs = build_tensor_specs(args.start_pos)
+    print(f"--- prefill_swa_cp: {CP} ranks x {T_LOC} rows, full={T}, devices={device_ids[:CP]} ---")
 
     result = run_jit(
-        fn=prefill_attention_swa_cp_test,
+        fn=l3_prefill_swa_cp,
         specs=specs,
-        golden_fn=golden_prefill_attention_swa_cp,
-        compile_cfg=dict(dump_passes=args.dump_passes),
+        golden_fn=golden_prefill_swa_cp,
+        compile_cfg=dict(
+            distributed_config=DistributedConfig(device_ids=device_ids[:CP], num_sub_workers=0),
+            dump_passes=args.dump_passes,
+        ),
         runtime_cfg=dict(
             platform=args.platform,
-            device_id=args.device,
             enable_l2_swimlane=args.enable_l2_swimlane,
             enable_dep_gen=args.enable_dep_gen,
         ),
@@ -586,8 +752,8 @@ if __name__ == "__main__":
         rtol=1e-2,
         atol=1e-2,
         compare_fn={
-            "x_out": valid_ratio_reldiff(compare_tokens, diff_thd=3e-3, pct_thd=0.005, max_diff_hd=1),
-            "kv_cache": ratio_allclose(atol=1e-4, rtol=1e-2),
+            "x_out": cp_valid_ratio_reldiff(compare_tokens, diff_thd=3e-3, pct_thd=0.005, max_diff_hd=1),
+            "kv_cache": cp_replica_allclose(atol=1e-4, rtol=1e-2),
         },
     )
     if not result.passed:
