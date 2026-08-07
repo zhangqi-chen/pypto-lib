@@ -564,6 +564,7 @@ def golden_prefill_sparse_attn(tensors):
 
     num_tokens = int(tensors["num_tokens"])
     q = tensors["q"].float()
+    t_rows = q.shape[0]
     ori_kv = tensors["ori_kv"].float()
     cmp_kv = tensors["cmp_kv"].float()
     cmp_block_table = tensors["cmp_block_table"]
@@ -576,7 +577,7 @@ def golden_prefill_sparse_attn(tensors):
     wo_b_i8 = tensors["wo_b"]
     wo_b_scale = tensors["wo_b_scale"].float()
 
-    o = torch.zeros(T, H, HEAD_DIM)
+    o = torch.zeros(t_rows, H, HEAD_DIM)
     for t in range(num_tokens):
         gathered = []
         for row_i in swa_indices[t].tolist():
@@ -634,18 +635,18 @@ def golden_prefill_sparse_attn(tensors):
     o_rope = torch.stack([inv_even, inv_odd], dim=-1).flatten(-2)
     o = torch.cat([o[..., :NOPE_DIM], o_rope], dim=-1).to(torch.bfloat16)
 
-    o_model = o.float().view(T, O_GROUPS, O_GROUP_IN)
+    o_model = o.float().view(t_rows, O_GROUPS, O_GROUP_IN)
     o_r = torch.einsum("tgd,grd->tgr", o_model, wo_a)   # [T, G, O_LORA]
     # Per-group INT8 activation quant: one amax per O_LORA group, not per full row. Each
     # group's INT32 partial is dequantized by its own per-row act scale -- the per-group
     # scale cannot factor out of the K-sum -- then the per-channel weight scale is applied.
-    o_r_g = o_r.reshape(T, O_GROUPS, O_LORA)
+    o_r_g = o_r.reshape(t_rows, O_GROUPS, O_LORA)
     amax_g = o_r_g.abs().amax(dim=-1, keepdim=True).clamp_min(INT8_AMAX_EPS)   # [T, G, 1]
     scale_q_g = INT8_SCALE_MAX / amax_g
     o_r_i8_g = torch.round(o_r_g * scale_q_g).to(torch.int32).to(torch.float16).to(torch.int8)
     scale_dq_g = 1.0 / scale_q_g                                              # [T, G, 1]
     wo_b_g = wo_b_i8.reshape(D, O_GROUPS, O_LORA)
-    out = torch.zeros(T, D, dtype=torch.float32)
+    out = torch.zeros(t_rows, D, dtype=torch.float32)
     for g in range(O_GROUPS):
         p_g = o_r_i8_g[:, g].to(torch.int32) @ wo_b_g[:, g].to(torch.int32).T   # [T, D]
         out = out + p_g.float() * scale_dq_g[:, g]                             # per-row group scale

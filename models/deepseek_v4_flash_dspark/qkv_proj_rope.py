@@ -68,7 +68,7 @@ def materialize_rope_rows(
     rope_sin_t: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
 ):
     t_dim = pl.tensor.dim(position_ids, 0)
-    for rope_t0 in pl.spmd(t_dim // KV_RMS_T_TILE, name_hint="qkv_rope_rows"):
+    for rope_t0 in pl.spmd(t_dim // KV_RMS_T_TILE, name_hint="rope_rows"):
         t0 = rope_t0 * KV_RMS_T_TILE
         for rope_dt in pl.range(KV_RMS_T_TILE):
             rope_t = t0 + rope_dt
@@ -76,6 +76,28 @@ def materialize_rope_rows(
                 rope_pos = pl.cast(pl.read(position_ids, [rope_t]), pl.INDEX)
                 rope_cos_t[rope_t : rope_t + 1, 0:ROPE_DIM] = freqs_cos[rope_pos : rope_pos + 1, 0:ROPE_DIM]
                 rope_sin_t[rope_t : rope_t + 1, 0:ROPE_DIM] = freqs_sin[rope_pos : rope_pos + 1, 0:ROPE_DIM]
+
+
+@pl.jit.inline
+def materialize_kv_rope_rows(
+    freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_DIM], pl.BF16],
+    position_ids: pl.Tensor[[KV_T_DYN], pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
+    rope_cos_t: pl.Tensor[[KV_T_DYN, ROPE_DIM], pl.BF16],
+    rope_sin_t: pl.Tensor[[KV_T_DYN, ROPE_DIM], pl.BF16],
+):
+    """materialize_rope_rows on the kv token axis."""
+    t_dim = pl.tensor.dim(position_ids, 0)
+    for rope_t0 in pl.spmd(t_dim // KV_RMS_T_TILE, name_hint="kv_rope_rows"):
+        t0 = rope_t0 * KV_RMS_T_TILE
+        for rope_dt in pl.range(KV_RMS_T_TILE):
+            rope_t = t0 + rope_dt
+            if rope_t < num_tokens:
+                rope_pos = pl.cast(pl.read(position_ids, [rope_t]), pl.INDEX)
+                rope_cos_t[rope_t : rope_t + 1, 0:ROPE_DIM] = freqs_cos[rope_pos : rope_pos + 1, 0:ROPE_DIM]
+                rope_sin_t[rope_t : rope_t + 1, 0:ROPE_DIM] = freqs_sin[rope_pos : rope_pos + 1, 0:ROPE_DIM]
+
 
 @pl.jit.inline
 def rope_prepare(
