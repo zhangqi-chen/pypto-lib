@@ -87,6 +87,7 @@ PROJ_A_ROW_TILE = min(256, T_PAD)
 PROJ_B_ROW_TILE = min(128, T_PAD)
 # Task-array fan-outs; named because a deps= list comprehension cannot be hoisted
 # out of the call (the tracer rejects a bare ListComp statement).
+O_GROUPS_LOC = O_GROUPS  # groups owned by this rank; CP shards it, the fused path does not
 PA_NFRAGS = O_LORA // PROJ_A_MM_N_TILE
 PB_DSLABS = D // PROJ_B_D_TILE
 PREFILL_ATTN_TILE = 128      # sparse-K rows per compile-time block
@@ -99,9 +100,8 @@ SPARSE_BIAS_COLS = min(TOPK, PREFILL_SPARSE_PAD)
 SPARSE_CMP_BIAS_COLS = max(0, SPARSE_BIAS_COLS - WIN)
 
 assert WIN == PREFILL_ATTN_TILE, f"Sparse prefill expects WIN ({WIN}) == PREFILL_ATTN_TILE ({PREFILL_ATTN_TILE})"
-
 @pl.jit.inline(auto_scope=False)
-def sparse_attn_compute(
+def sparse_attn_core(
     q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
     sparse_kv: pl.Tensor[[T_PAD * PREFILL_SPARSE_PAD, HEAD_DIM], pl.BF16],
     sparse_bias: pl.Tensor[[T_PAD, PREFILL_SPARSE_PAD], pl.FP32],
@@ -109,18 +109,18 @@ def sparse_attn_compute(
     attn_sink: pl.Tensor[[H], pl.FP32],
     freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
-    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
-    wo_b_scale: pl.Tensor[[D], pl.FP32],
-    attn_out: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
+    o_packed: pl.Tensor[[T_PAD, H * HEAD_DIM], pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
 ):
-    """Run source-independent sparse QK/PV, merge, inverse RoPE, and projection."""
+    """Sparse QK/PV, flash merge and inverse RoPE into token-major, head-minor o_packed.
+
+    Stops before the output projection so a CP caller can redistribute the token rows
+    across ranks first; ``sparse_attn`` chains the two for the non-CP path."""
     t_dim = pl.tensor.dim(q, 0)
 
-    # o_packed outlives the attention scope below: merge fills it, proj_a reads it after.
-    o_packed_heads = pl.create_tensor([O_GROUPS * T_PAD * HEADS_PER_GROUP, HEAD_DIM], dtype=pl.BF16)
-    o_packed = pl.reshape(o_packed_heads, [O_GROUPS * T_PAD, O_GROUP_IN])
+    o_packed_heads = pl.reshape(o_packed, [T_PAD * H, HEAD_DIM])
+    # merge_tid is carried out through an array: a TaskId cannot cross a closed scope.
+    merge_tids = pl.array.create(1, pl.TASK_ID)
 
     t_blk = t_dim * (H // HEAD_TILE) * PREFILL_ATTN_BLOCKS * HEAD_TILE
     t_heads = t_dim * H
@@ -262,44 +262,38 @@ def sparse_attn_compute(
                 m_rot = pl.add(m_rope_cos, m_swapped_sin)
                 n_rope_bf16 = pl.cast(m_rot, target_type=pl.BF16, mode="rint")
 
-                if HEAD_TILE % HEADS_PER_GROUP == 0:
-                    m_g0 = m_h0 // HEADS_PER_GROUP
-                    for m_sg in pl.unroll(HEAD_TILE // HEADS_PER_GROUP):
-                        m_src_h0 = m_sg * HEADS_PER_GROUP
-                        m_pack_row = (m_g0 + m_sg) * T_PAD + m_t
-                        m_dst_head = m_pack_row * HEADS_PER_GROUP
-                        # Slice bounds must stay inline: a named end offset loses the static
-                        # dim, and a named source materializes an extra tile.
-                        o_packed_heads[
-                            m_dst_head:m_dst_head + HEADS_PER_GROUP, 0:NOPE_DIM
-                        ] = n_bf16[
-                            m_src_h0:m_src_h0 + HEADS_PER_GROUP, 0:NOPE_DIM
-                        ]
-                        o_packed_heads[
-                            m_dst_head:m_dst_head + HEADS_PER_GROUP, NOPE_DIM:HEAD_DIM
-                        ] = n_rope_bf16[
-                            m_src_h0:m_src_h0 + HEADS_PER_GROUP, 0:ROPE_DIM
-                        ]
-                else:
-                    # Store groups crossing a head tile one head at a time.
-                    for m_hi in pl.range(HEAD_TILE):
-                        m_gh = m_h0 + m_hi
-                        m_g = m_gh // HEADS_PER_GROUP
-                        m_pack_row = m_g * T_PAD + m_t
-                        m_col = (m_gh - m_g * HEADS_PER_GROUP) * HEAD_DIM
-                        o_packed[m_pack_row:m_pack_row + 1, m_col:m_col + NOPE_DIM] = n_bf16[m_hi:m_hi + 1, 0:NOPE_DIM]
-                        m_rope_row = n_rope_bf16[m_hi:m_hi + 1, 0:ROPE_DIM]
-                        o_packed[m_pack_row:m_pack_row + 1, m_col + NOPE_DIM:m_col + HEAD_DIM] = m_rope_row
+                # One contiguous head-tile run per token; no group reorder.
+                m_dst_head = m_t * H + m_h0
+                o_packed_heads[m_dst_head:m_dst_head + HEAD_TILE, 0:NOPE_DIM] = n_bf16[:, 0:NOPE_DIM]
+                o_packed_heads[m_dst_head:m_dst_head + HEAD_TILE, NOPE_DIM:HEAD_DIM] = n_rope_bf16[:, 0:ROPE_DIM]
         merge_tids[0] = merge_tid
+    return merge_tids[0]
+
+
+@pl.jit.inline(auto_scope=False)
+def o_proj(
+    o_packed: pl.Tensor[[T_PAD, H * HEAD_DIM], pl.BF16],
+    wo_a: pl.Tensor[[O_GROUPS_LOC, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b: pl.Tensor[[D, O_GROUPS_LOC * O_LORA], pl.INT8],
+    wo_b_scale: pl.Tensor[[D], pl.FP32],
+    attn_out: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
+    merge_dep: pl.Scalar[pl.TASK_ID],
+    num_tokens: pl.Scalar[pl.INT32],
+):
+    """Grouped output projection over the local group band: proj_a -> quant -> proj_b.
+
+    Under CP the caller owns only ``O_GROUPS_LOC`` of the groups, so ``attn_out`` is a
+    partial sum that a reduce-scatter has to complete."""
+    t_dim = pl.tensor.dim(attn_out, 0)
 
     # Chain merge, quantization, and projection through explicit task dependencies.
-    o_r = pl.create_tensor([T_PAD, O_GROUPS * O_LORA], dtype=pl.FP32)
-    o_r_i8 = pl.create_tensor([T_PAD, O_GROUPS * O_LORA], dtype=pl.INT8)
-    act_scale_dq = pl.create_tensor([O_GROUPS, T_PAD], dtype=pl.FP32)
-    partials = pl.create_tensor([T_PAD, O_GROUPS * D], dtype=pl.INT32)
-    proj_a_tids = pl.array.create(O_GROUPS * PA_NFRAGS, pl.TASK_ID)
-    quant_tids = pl.array.create(O_GROUPS * QUANT_CHUNKS, pl.TASK_ID)
-    proj_b_tids = pl.array.create(PB_DSLABS * O_GROUPS, pl.TASK_ID)
+    o_r = pl.create_tensor([T_PAD, O_GROUPS_LOC * O_LORA], dtype=pl.FP32)
+    o_r_i8 = pl.create_tensor([T_PAD, O_GROUPS_LOC * O_LORA], dtype=pl.INT8)
+    act_scale_dq = pl.create_tensor([O_GROUPS_LOC, T_PAD], dtype=pl.FP32)
+    partials = pl.create_tensor([T_PAD, O_GROUPS_LOC * D], dtype=pl.INT32)
+    proj_a_tids = pl.array.create(O_GROUPS_LOC * PA_NFRAGS, pl.TASK_ID)
+    quant_tids = pl.array.create(O_GROUPS_LOC * QUANT_CHUNKS, pl.TASK_ID)
+    proj_b_tids = pl.array.create(PB_DSLABS * O_GROUPS_LOC, pl.TASK_ID)
     proj_a_rows = (t_dim + PROJ_A_ROW_TILE - 1) // PROJ_A_ROW_TILE
     proj_b_rows = (t_dim + PROJ_B_ROW_TILE - 1) // PROJ_B_ROW_TILE
 
@@ -307,23 +301,22 @@ def sparse_attn_compute(
         # proj_a[g, nf]: BF16 grouped GEMM -> o_r[:, group g], peel-first-iter form.
         # Row-blocked over PROJ_A_ROW_TILE with a padded load, so the T_PAD-strided
         # o_packed slab never feeds uninitialized rows into the matmul.
-        for g in pl.parallel(O_GROUPS):
-            row_base_o = g * T_PAD
+        for g in pl.parallel(O_GROUPS_LOC):
+            in_col_g = g * O_GROUP_IN
             out_col_g = g * O_LORA
             for nf in pl.range(PA_NFRAGS):
                 n0 = nf * PROJ_A_MM_N_TILE
-                with pl.spmd(proj_a_rows, name_hint="proj_a_mm", deps=[merge_tids[0]]) as pa_tid:
+                with pl.spmd(proj_a_rows, name_hint="proj_a_mm", deps=[merge_dep]) as pa_tid:
                     pa_rb = pl.tile.get_block_idx()
                     pa_r0 = pa_rb * PROJ_A_ROW_TILE
                     pa_rows = pl.min(PROJ_A_ROW_TILE, t_dim - pa_r0)
-                    pa_src0 = row_base_o + pa_r0
-                    xa0_chunk = pl.slice(o_packed, [PROJ_A_ROW_TILE, A_K_TILE], [pa_src0, 0],
+                    xa0_chunk = pl.slice(o_packed, [PROJ_A_ROW_TILE, A_K_TILE], [pa_r0, in_col_g],
                                          valid_shape=[pa_rows, A_K_TILE])
                     wa0_chunk = wo_a[g:g + 1, n0:n0 + PROJ_A_MM_N_TILE, 0:A_K_TILE]
                     acc_a = pl.matmul(xa0_chunk, wa0_chunk, b_trans=True, out_dtype=pl.FP32)
                     for kb in pl.pipeline(1, O_GROUP_IN // A_K_TILE, stage=2):
                         k0 = kb * A_K_TILE
-                        xa_k_chunk = pl.slice(o_packed, [PROJ_A_ROW_TILE, A_K_TILE], [pa_src0, k0],
+                        xa_k_chunk = pl.slice(o_packed, [PROJ_A_ROW_TILE, A_K_TILE], [pa_r0, in_col_g + k0],
                                               valid_shape=[pa_rows, A_K_TILE])
                         wa_k_chunk = wo_a[g:g + 1, n0:n0 + PROJ_A_MM_N_TILE, k0:k0 + A_K_TILE]
                         acc_a = pl.matmul_acc(acc_a, xa_k_chunk, wa_k_chunk, b_trans=True)
@@ -336,7 +329,7 @@ def sparse_attn_compute(
         quant_t_tile = t_dim // QUANT_CHUNKS
         for tc in pl.parallel(QUANT_CHUNKS):
             t_base = tc * quant_t_tile
-            for g in pl.range(O_GROUPS):
+            for g in pl.range(O_GROUPS_LOC):
                 col_g = g * O_LORA
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="quant",
                            deps=[proj_a_tids[g * PA_NFRAGS + j] for j in range(PA_NFRAGS)]) as q_tid:
@@ -365,7 +358,7 @@ def sparse_attn_compute(
         # zero carry trips TLOAD DN->NZ (pypto#1540).
         for dc in pl.parallel(PB_DSLABS):
             d0 = dc * PROJ_B_D_TILE
-            for g in pl.range(O_GROUPS):
+            for g in pl.range(O_GROUPS_LOC):
                 col_g = g * O_LORA
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="proj_b_mm",
                            deps=[quant_tids[g * QUANT_CHUNKS + tc] for tc in range(QUANT_CHUNKS)]) as pb_tid:
@@ -385,13 +378,13 @@ def sparse_attn_compute(
                                 b_weight = wo_b[n0:n0 + PROJ_B_MM_N_TILE, k0:k0 + B_K_TILE]
                                 acc_b = pl.matmul_acc(acc_b, b_act, b_weight, b_trans=True)
                             partials[pb_r0:pb_r0 + PROJ_B_ROW_TILE, g * D + n0:g * D + n0 + PROJ_B_MM_N_TILE] = acc_b
-                proj_b_tids[dc * O_GROUPS + g] = pb_tid
+                proj_b_tids[dc * O_GROUPS_LOC + g] = pb_tid
 
     # Dequantize and sum per-group INT32 partials into the BF16 output.
     act_t_blks = t_dim // PROJ_B_ACT_TASK_T_TILE
     act_blocks = (D // PROJ_B_ACT_N_TILE) * act_t_blks
     with pl.spmd(act_blocks, name_hint="proj_b_act",
-                 deps=[proj_b_tids[i] for i in range(PB_DSLABS * O_GROUPS)]) as act_tid:
+                 deps=[proj_b_tids[i] for i in range(PB_DSLABS * O_GROUPS_LOC)]) as act_tid:
         act_idx = pl.tile.get_block_idx()
         nreg = act_idx // act_t_blks
         tblk = act_idx - nreg * act_t_blks
@@ -401,7 +394,7 @@ def sparse_attn_compute(
         wb_scale_chunk = pl.reshape(wb_scale, [1, PROJ_B_ACT_N_TILE])
         for b_tb in pl.range(t0, t0 + PROJ_B_ACT_TASK_T_TILE, PROJ_B_ACT_T_TILE):
             acc = pl.full([PROJ_B_ACT_T_TILE, PROJ_B_ACT_N_TILE], dtype=pl.FP32, value=0.0)
-            for g in pl.range(O_GROUPS):
+            for g in pl.range(O_GROUPS_LOC):
                 p_g = partials[b_tb:b_tb + PROJ_B_ACT_T_TILE, g * D + ob_n0:g * D + ob_n0 + PROJ_B_ACT_N_TILE]
                 g_scale_row = act_scale_dq[g:g + 1, b_tb:b_tb + PROJ_B_ACT_T_TILE]
                 g_scale = pl.reshape(g_scale_row, [PROJ_B_ACT_T_TILE, 1])
@@ -413,7 +406,6 @@ def sparse_attn_compute(
             attn_out[b_tb:b_tb + PROJ_B_ACT_T_TILE, ob_n0:ob_n0 + PROJ_B_ACT_N_TILE] = out_bf16
 
     return attn_out
-
 
 @pl.jit.inline
 def sparse_attn(
@@ -512,14 +504,15 @@ def sparse_attn(
             bias_pad = pl.full([BIAS_TOKEN_TILE, bias_pad_cols], dtype=pl.FP32, value=FP32_NEG_INF)
             sparse_bias[bias_t0:bias_t0 + BIAS_TOKEN_TILE, SPARSE_BIAS_COLS:PREFILL_SPARSE_PAD] = bias_pad
 
-    return sparse_attn_compute(
-        q,
-        sparse_kv, sparse_bias,
-        valid_block_mask, attn_sink,
+    # Token-major, head-minor: group g is the column band [g*O_GROUP_IN, (g+1)*O_GROUP_IN),
+    # so a proj_a K-frag is the same tile shape as under a group-major layout.
+    o_packed = pl.create_tensor([T_PAD, H * HEAD_DIM], dtype=pl.BF16)
+    merge_dep = sparse_attn_core(
+        q, sparse_kv, sparse_bias, valid_block_mask, attn_sink,
         freqs_cos, freqs_sin,
-        wo_a, wo_b, wo_b_scale,
-        attn_out, num_tokens,
+        o_packed, num_tokens,
     )
+    o_proj(o_packed, wo_a, wo_b, wo_b_scale, attn_out, merge_dep, num_tokens)
 
 
 @pl.jit
@@ -549,7 +542,7 @@ def prefill_sparse_attn_test(
     freqs_cos.bind_dynamic(0, T_DYN)
     freqs_sin.bind_dynamic(0, T_DYN)
     attn_out.bind_dynamic(0, T_DYN)
-    return sparse_attn(
+    sparse_attn(
         q, ori_kv, swa_indices,
         cmp_kv, cmp_block_table, cmp_indices,
         valid_block_mask, attn_sink, num_tokens,
@@ -557,6 +550,7 @@ def prefill_sparse_attn_test(
         wo_a, wo_b, wo_b_scale,
         attn_out,
     )
+    return attn_out
 
 def golden_prefill_sparse_attn(tensors):
     """Self-contained torch reference for the cache-first sparse-attn entry."""
