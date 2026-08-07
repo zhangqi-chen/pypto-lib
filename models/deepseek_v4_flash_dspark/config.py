@@ -244,7 +244,7 @@ DECODE_SEQ = 2                    # S: [previous, current] tokens per serving st
 DECODE_TOKENS = DECODE_BATCH * DECODE_SEQ
 DECODE_START_POS = 8192
 PREFILL_BATCH = 1                 # B: prefill batch for the current kernel programs
-PREFILL_SEQ = 128                 # S: prefill sequence for the current kernel programs
+PREFILL_SEQ = 1024                # S: prefill sequence for the current kernel programs
 PREFILL_TOKENS = PREFILL_BATCH * PREFILL_SEQ
 
 # Implementation constants
@@ -284,6 +284,7 @@ FP32_NEG_INF = -3.4028234663852886e38     # most-negative finite fp32 (softmax m
 TP = 4         # tensor-parallel ranks per DP group
 DP = 4         # DP groups per node
 EP = 16        # expert-parallel world size (moe overrides it from --ep)
+CP = 4         # context-parallel ranks for prefill attention; always equals TP
 
 # Per-component TP degree, over the components that shard.
 TP_Q_B = TP            # wq_b: ColumnParallel over heads
