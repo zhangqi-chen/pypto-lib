@@ -32,6 +32,7 @@ def _parse_cp_argv():
 
 CP = _parse_cp_argv()
 config.CP = CP
+config.TP_O = CP
 
 import pypto.language as pl
 import pypto.language.distributed as pld
@@ -59,11 +60,14 @@ from qkv_proj_rope import (
 )
 from rmsnorm import golden_rms_norm, rms_norm
 from prefill_sparse_attn import (
+    O_GROUPS_LOC,
     PREFILL_ATTN_TILE,
     SPARSE_BIAS_COLS,
+    T_PAD,
     VALID_BLOCK_MASK_COLS,
     golden_prefill_sparse_attn,
-    sparse_attn,
+    o_proj,
+    sparse_attn_core,
 )
 
 
@@ -94,6 +98,8 @@ O_LORA = M.o_lora_rank
 O_GROUPS = M.o_groups
 HEADS_PER_GROUP = H // O_GROUPS
 O_GROUP_IN = HEADS_PER_GROUP * HEAD_DIM
+H_LOC = H // CP            # heads this rank owns after the all-to-all
+O_COLS_LOC = O_GROUPS_LOC * O_GROUP_IN  # == H_LOC * HEAD_DIM
 
 # paged KV cache. The ratio-0 path carries only the sliding-window cache.
 BLOCK_NUM = PREFILL_ORI_BLOCK_NUM
@@ -103,6 +109,8 @@ START_POS = 0
 
 # tiling
 GATHER_ROW_TILE = 8   # x_normed all-gather publish / stage-out row block
+A2A_ROW_TILE = 2      # attention-output all-to-all publish / stage-out row block
+RS_ROW_TILE = 4       # reduce-scatter publish / accumulate row block
 
 assert CP in _CP_CHOICES, f"--cp must be one of {_CP_CHOICES} (got {CP})"
 assert WIN == BLOCK_SIZE, "SWA prefill currently assumes one window page per batch"
@@ -131,11 +139,15 @@ def prefill_swa_cp(
     position_ids: pl.Tensor[[T], pl.INT32],
     position_ids_local: pl.Tensor[[T_LOC], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
-    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
+    wo_a: pl.Tensor[[O_GROUPS_LOC, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b: pl.Tensor[[D, O_GROUPS_LOC * O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     x_norm_window: pld.DistributedTensor[[T, D], pl.BF16],
     ready: pld.DistributedTensor[[CP, 1], pl.INT32],
+    o_window: pld.DistributedTensor[[T, O_COLS_LOC], pl.BF16],
+    a2a_ready: pld.DistributedTensor[[CP, 1], pl.INT32],
+    rs_window: pld.DistributedTensor[[T, D], pl.BF16],
+    rs_ready: pld.DistributedTensor[[CP, 1], pl.INT32],
     x_out: pl.Out[pl.Tensor[[T_LOC, HC_MULT, D], pl.FP32]],
     num_tokens_full: pl.Scalar[pl.INT32],
     num_tokens_local: pl.Scalar[pl.INT32],
@@ -252,18 +264,76 @@ def prefill_swa_cp(
     cmp_block_table_dummy = pl.create_tensor([SPARSE_CMP_MAX_BLOCKS], dtype=pl.INT32, init_value=0)
     cmp_kv_dummy = pl.create_tensor([CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], dtype=pl.BF16)
     cmp_indices_dummy = pl.create_tensor([T_LOC, IDX_TOPK], dtype=pl.INT32, init_value=-1)
-    attn_out = pl.create_tensor([T_LOC, D], dtype=pl.BF16)
-    # The inverse RoPE inside sparse_attn un-rotates by the LOCAL token positions, so it
-    # has to run before any all_to_all redistributes the token rows.
-    sparse_attn(
+    # The inverse RoPE inside the core un-rotates by the LOCAL token positions, so it has
+    # to run before the all-to-all redistributes the token rows.
+    o_local = pl.create_tensor([T_PAD, H * HEAD_DIM], dtype=pl.BF16)
+    sparse_attn_core(
         q, kv_cache, swa_indices,
         cmp_kv_dummy, cmp_block_table_dummy,
         cmp_indices_dummy,
-        valid_block_mask,
-        attn_sink, num_tokens_local,
+        valid_block_mask, attn_sink,
         rope_cos_loc, rope_sin_loc,
-        wo_a, wo_b, wo_b_scale, attn_out,
+        o_local, num_tokens_local,
     )
+
+    # All-to-all: token-split -> head-split. o_local is token-major and head-minor, so
+    # peer p's heads are the column band [p*O_COLS_LOC, (p+1)*O_COLS_LOC) and land in
+    # peer p's window at row my_rank*T_LOC. The window is then [T, O_COLS_LOC] with
+    # global token index s*T_LOC + t, ready for o_proj with no local reorder.
+    o_full = pl.create_tensor([T_PAD, O_COLS_LOC], dtype=pl.BF16)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_o_all_to_all") as a2a_tid:
+        for peer in pl.range(CP):
+            pld.tensor.put(
+                dst=o_window, peer=peer, src=o_local,
+                dst_offsets=[my_rank * T_LOC, 0], src_offsets=[0, peer * O_COLS_LOC],
+                shape=[T_LOC, O_COLS_LOC],
+                chunk_rows=A2A_ROW_TILE, chunk_cols=O_COLS_LOC, pipeline=True,
+            )
+        for peer in pl.range(CP):
+            if peer != my_rank:
+                pld.system.notify(
+                    target=a2a_ready, peer=peer, offsets=[my_rank, 0],
+                    value=1, op=pld.NotifyOp.AtomicAdd,
+                )
+        for src in pl.range(CP):
+            if src != my_rank:
+                pld.system.wait(signal=a2a_ready, offsets=[src, 0], expected=1, cmp=pld.WaitCmp.Ge)
+
+        for t0 in pl.range(0, T, A2A_ROW_TILE):
+            o_full[t0 : t0 + A2A_ROW_TILE, 0:O_COLS_LOC] = o_window[t0 : t0 + A2A_ROW_TILE, 0:O_COLS_LOC]
+
+    # o_proj over this rank's group band only, so attn_partial is a partial sum over D.
+    attn_partial = pl.create_tensor([T, D], dtype=pl.BF16)
+    o_proj(o_full, wo_a, wo_b, wo_b_scale, attn_partial, a2a_tid, num_tokens_full)
+
+    # Reduce-scatter: rank r keeps the sum over ranks of rows [r*T_LOC, (r+1)*T_LOC).
+    # Each rank drops its slice for peer p into slot my_rank of p's window, so the sum is
+    # a local accumulate and needs no atomics or a zeroed window.
+    attn_out = pl.create_tensor([T_LOC, D], dtype=pl.BF16)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_o_reduce_scatter"):
+        for peer in pl.range(CP):
+            pld.tensor.put(
+                dst=rs_window, peer=peer, src=attn_partial,
+                dst_offsets=[my_rank * T_LOC, 0], src_offsets=[peer * T_LOC, 0],
+                shape=[T_LOC, D],
+                chunk_rows=RS_ROW_TILE, chunk_cols=D, pipeline=True,
+            )
+        for peer in pl.range(CP):
+            if peer != my_rank:
+                pld.system.notify(
+                    target=rs_ready, peer=peer, offsets=[my_rank, 0],
+                    value=1, op=pld.NotifyOp.AtomicAdd,
+                )
+        for src in pl.range(CP):
+            if src != my_rank:
+                pld.system.wait(signal=rs_ready, offsets=[src, 0], expected=1, cmp=pld.WaitCmp.Ge)
+
+        for t0 in pl.range(0, T_LOC, RS_ROW_TILE):
+            rs_acc = pl.full([RS_ROW_TILE, D], dtype=pl.FP32, value=0.0)
+            for src in pl.range(CP):
+                rs_slab = rs_window[src * T_LOC + t0 : src * T_LOC + t0 + RS_ROW_TILE, 0:D]
+                rs_acc = pl.add(rs_acc, pl.cast(rs_slab, target_type=pl.FP32))
+            attn_out[t0 : t0 + RS_ROW_TILE, 0:D] = pl.cast(rs_acc, target_type=pl.BF16, mode="rint")
 
     hc_post_prefill(attn_out, x_hc, post, comb, x_out, num_tokens_local)
 
@@ -289,11 +359,15 @@ def l2_prefill_swa_cp(
     position_ids: pl.Tensor[[T], pl.INT32],
     position_ids_local: pl.Tensor[[T_LOC], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
-    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
+    wo_a: pl.Tensor[[O_GROUPS_LOC, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b: pl.Tensor[[D, O_GROUPS_LOC * O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     x_norm_window: pld.DistributedTensor[[T, D], pl.BF16],
     ready: pld.DistributedTensor[[CP, 1], pl.INT32],
+    o_window: pld.DistributedTensor[[T, O_COLS_LOC], pl.BF16],
+    a2a_ready: pld.DistributedTensor[[CP, 1], pl.INT32],
+    rs_window: pld.DistributedTensor[[T, D], pl.BF16],
+    rs_ready: pld.DistributedTensor[[CP, 1], pl.INT32],
     x_out: pl.Out[pl.Tensor[[T_LOC, HC_MULT, D], pl.FP32]],
     num_tokens_full: pl.Scalar[pl.INT32],
     num_tokens_local: pl.Scalar[pl.INT32],
@@ -307,7 +381,7 @@ def l2_prefill_swa_cp(
         kv_cache, block_table, ori_slot_mapping,
         position_ids, position_ids_local,
         attn_sink, wo_a, wo_b, wo_b_scale,
-        x_norm_window, ready,
+        x_norm_window, ready, o_window, a2a_ready, rs_window, rs_ready,
         x_out, num_tokens_full, num_tokens_local, my_rank,
     )
     return kv_cache, x_out
@@ -334,8 +408,8 @@ def l3_prefill_swa_cp(
     position_ids: pl.Tensor[[T], pl.INT32],
     position_ids_local: pl.Tensor[[CP, T_LOC], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
-    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
+    wo_a: pl.Tensor[[CP, O_GROUPS_LOC, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b: pl.Tensor[[CP, D, O_GROUPS_LOC * O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     x_out: pl.Out[pl.Tensor[[CP, T_LOC, HC_MULT, D], pl.FP32]],
     num_tokens_full: pl.Scalar[pl.INT32],
@@ -345,10 +419,18 @@ def l3_prefill_swa_cp(
     the token slice, its positions, the output and the kv_cache copy are per rank."""
     window_buf = pld.alloc_window_buffer([T, D], dtype=pl.BF16)
     ready_buf = pld.alloc_window_buffer([CP, 1], dtype=pl.INT32)
+    o_window_buf = pld.alloc_window_buffer([T, O_COLS_LOC], dtype=pl.BF16)
+    a2a_ready_buf = pld.alloc_window_buffer([CP, 1], dtype=pl.INT32)
+    rs_window_buf = pld.alloc_window_buffer([T, D], dtype=pl.BF16)
+    rs_ready_buf = pld.alloc_window_buffer([CP, 1], dtype=pl.INT32)
 
     for rank in pl.range(pld.world_size()):
         x_norm_window = pld.window(window_buf, [T, D], dtype=pl.BF16)
         ready = pld.window(ready_buf, [CP, 1], dtype=pl.INT32)
+        o_window = pld.window(o_window_buf, [T, O_COLS_LOC], dtype=pl.BF16)
+        a2a_ready = pld.window(a2a_ready_buf, [CP, 1], dtype=pl.INT32)
+        rs_window = pld.window(rs_window_buf, [T, D], dtype=pl.BF16)
+        rs_ready = pld.window(rs_ready_buf, [CP, 1], dtype=pl.INT32)
         l2_prefill_swa_cp(
             x_hc[rank],
             hc_attn_fn, hc_attn_scale, hc_attn_base,
@@ -356,8 +438,8 @@ def l3_prefill_swa_cp(
             freqs_cos, freqs_sin,
             kv_cache[rank], block_table, ori_slot_mapping,
             position_ids, position_ids_local[rank],
-            attn_sink, wo_a, wo_b, wo_b_scale,
-            x_norm_window, ready,
+            attn_sink, wo_a[rank], wo_b[rank], wo_b_scale,
+            x_norm_window, ready, o_window, a2a_ready, rs_window, rs_ready,
             x_out[rank], num_tokens_full, num_tokens_local, rank,
             device=rank,
         )
@@ -375,7 +457,8 @@ def _quant_w_per_output_channel(w):
     return w_i8, (1.0 / scale_quant).float()
 
 
-def _golden_swa_cp_rank(tensors, x_hc_local, position_ids_local, kv_cache_in, x_normed_full):
+def _golden_swa_cp_rank(tensors, x_hc_local, position_ids_local, kv_cache_in, x_normed_full,
+                        wo_a_full, wo_b_full):
     """Torch reference for one rank: q on its token slice, kv and writeback on the full run.
 
     Returns this rank's ``x_out`` slice; ``kv_cache_in`` is updated in place.
@@ -479,8 +562,8 @@ def _golden_swa_cp_rank(tensors, x_hc_local, position_ids_local, kv_cache_in, x_
         "num_tokens": tensors["num_tokens_local"],
         "freqs_cos": rope_cos_loc,
         "freqs_sin": rope_sin_loc,
-        "wo_a": tensors["wo_a"],
-        "wo_b": tensors["wo_b"],
+        "wo_a": wo_a_full,
+        "wo_b": wo_b_full,
         "wo_b_scale": tensors["wo_b_scale"],
         "attn_out": attn_out,
     })
@@ -517,16 +600,20 @@ def _golden_local_norm(tensors, x_hc_local):
 
 
 def golden_prefill_swa_cp(tensors):
-    """Torch reference: the all_gather is the rank-ordered concat of the local norms."""
+    """Torch reference: the all_gather is the rank-ordered concat of the local norms, and
+    the sharded o_proj is the full-weight projection the reduce-scatter reassembles."""
     import torch
 
     slices = [_golden_local_norm(tensors, tensors["x_hc"][rank].view(T_LOC, HC_MULT, D)) for rank in range(CP)]
     x_normed_full = torch.cat(slices, dim=0).to(torch.bfloat16)
+    wo_a_full = tensors["wo_a"].reshape(O_GROUPS, O_LORA, O_GROUP_IN)
+    wo_b_full = tensors["wo_b"].permute(1, 0, 2).reshape(D, O_GROUPS * O_LORA)
     for rank in range(CP):
         kv_cache_in = tensors["kv_cache"][rank].clone()
         x_hc_local = tensors["x_hc"][rank].view(T_LOC, HC_MULT, D)
         y = _golden_swa_cp_rank(
             tensors, x_hc_local, tensors["position_ids_local"][rank], kv_cache_in, x_normed_full,
+            wo_a_full, wo_b_full,
         )
         tensors["kv_cache"][rank] = kv_cache_in
         tensors["x_out"][rank] = y
@@ -623,6 +710,10 @@ def build_tensor_specs(start_pos: int = START_POS, num_tokens: int = T):
     wq_b_i8, wq_b_scale = _quant_w_per_output_channel(wq_b_bf16)
     wo_b_bf16 = ((torch.rand(D, O_GROUPS * O_LORA) - 0.5) * (O_GROUPS * O_LORA) ** -0.5).to(torch.bfloat16)
     wo_b_i8, wo_b_scale = quant_w_per_channel(wo_b_bf16)
+    wo_a_full = ((torch.rand(O_GROUPS, O_LORA, O_GROUP_IN) - 0.5) * O_GROUP_IN ** -0.5).to(torch.bfloat16)
+    # o_proj is TP-sharded: wo_a splits on the group axis, wo_b on the matching K band.
+    wo_a_local = wo_a_full.view(CP, O_GROUPS_LOC, O_LORA, O_GROUP_IN).contiguous()
+    wo_b_local = wo_b_i8.view(D, CP, O_GROUPS_LOC * O_LORA).permute(1, 0, 2).contiguous()
 
     return num_tokens_local, [
         TensorSpec("x_hc", [CP] + [T_LOC, HC_MULT, D], torch.float32, init_value=lambda: x_hc_local),
@@ -645,9 +736,9 @@ def build_tensor_specs(start_pos: int = START_POS, num_tokens: int = T):
         TensorSpec("position_ids", [T], torch.int32, init_value=lambda: position_ids),
         TensorSpec("position_ids_local", [CP] + [T_LOC], torch.int32, init_value=lambda: position_ids_local),
         TensorSpec("attn_sink", [H], torch.float32, init_value=lambda: torch.zeros(H)),
-        TensorSpec("wo_a", [O_GROUPS, O_LORA, O_GROUP_IN], torch.bfloat16,
-                   init_value=lambda: (torch.rand(O_GROUPS, O_LORA, O_GROUP_IN) - 0.5) * O_GROUP_IN ** -0.5),
-        TensorSpec("wo_b", [D, O_GROUPS * O_LORA], torch.int8, init_value=lambda: wo_b_i8),
+        TensorSpec("wo_a", [CP, O_GROUPS_LOC, O_LORA, O_GROUP_IN], torch.bfloat16,
+                   init_value=lambda: wo_a_local),
+        TensorSpec("wo_b", [CP, D, O_GROUPS_LOC * O_LORA], torch.int8, init_value=lambda: wo_b_local),
         TensorSpec("wo_b_scale", [D], torch.float32, init_value=lambda: wo_b_scale),
         TensorSpec("x_out", [CP] + [T_LOC, HC_MULT, D], torch.float32, is_output=True),
         ScalarSpec("num_tokens_full", torch.int32, num_tokens),

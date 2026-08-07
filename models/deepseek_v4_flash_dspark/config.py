@@ -288,8 +288,7 @@ CP = 4         # context-parallel ranks for prefill attention; always equals TP
 
 # Per-component TP degree, over the components that shard.
 TP_Q_B = TP            # wq_b: ColumnParallel over heads
-TP_O_A = TP            # wo_a: ColumnParallel over o_groups
-TP_O_B = TP            # wo_b: RowParallel, then allreduce
+TP_O = 1               # wo_a: ColumnParallel over o_groups; wo_b: RowParallel, then a reduce
 TP_ATTN_SINK = TP      # attn_sink: one entry per local head
 TP_SHARED_EXPERT = TP  # shared expert: gate_up ColumnParallel, down RowParallel then allreduce
 TP_VOCAB = TP          # embed_tokens / lm_head: vocab-parallel

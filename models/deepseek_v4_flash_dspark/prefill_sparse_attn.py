@@ -25,6 +25,7 @@ from config import (
     PREFILL_CMP_MAX_BLOCKS,
     PREFILL_ORI_BLOCK_NUM,
     PREFILL_SEQ,
+    TP_O,
 )
 
 # Dynamic shape variables.
@@ -87,7 +88,7 @@ PROJ_A_ROW_TILE = min(256, T_PAD)
 PROJ_B_ROW_TILE = min(128, T_PAD)
 # Task-array fan-outs; named because a deps= list comprehension cannot be hoisted
 # out of the call (the tracer rejects a bare ListComp statement).
-O_GROUPS_LOC = O_GROUPS  # groups owned by this rank; CP shards it, the fused path does not
+O_GROUPS_LOC = O_GROUPS // TP_O  # o_proj groups this rank owns
 PA_NFRAGS = O_LORA // PROJ_A_MM_N_TILE
 PB_DSLABS = D // PROJ_B_D_TILE
 PREFILL_ATTN_TILE = 128      # sparse-K rows per compile-time block
@@ -103,8 +104,11 @@ assert WIN == PREFILL_ATTN_TILE, f"Sparse prefill expects WIN ({WIN}) == PREFILL
 @pl.jit.inline(auto_scope=False)
 def sparse_attn_core(
     q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
-    sparse_kv: pl.Tensor[[T_PAD * PREFILL_SPARSE_PAD, HEAD_DIM], pl.BF16],
-    sparse_bias: pl.Tensor[[T_PAD, PREFILL_SPARSE_PAD], pl.FP32],
+    ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
+    cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    cmp_block_table: pl.Tensor[[CMP_MAX_BLOCKS], pl.INT32],
+    cmp_indices: pl.Tensor[[T_DYN, IDX_TOPK], pl.INT32],
     valid_block_mask: pl.Tensor[[T_DYN, VALID_BLOCK_MASK_COLS], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
     freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
@@ -112,11 +116,89 @@ def sparse_attn_core(
     o_packed: pl.Tensor[[T_PAD, H * HEAD_DIM], pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
 ):
-    """Sparse QK/PV, flash merge and inverse RoPE into token-major, head-minor o_packed.
+    """Stage the sparse sources and bias, then run QK/PV, the flash merge and the
+    inverse RoPE into token-major, head-minor o_packed.
 
     Stops before the output projection so a CP caller can redistribute the token rows
     across ranks first; ``sparse_attn`` chains the two for the non-CP path."""
     t_dim = pl.tensor.dim(q, 0)
+    gather_blocks = (t_dim + GATHER_TOKEN_TILE - 1) // GATHER_TOKEN_TILE
+    ori_block_num = pl.tensor.dim(ori_kv, 0)
+    ori_cache_rows = ori_block_num * BLOCK_SIZE
+    ori_kv_flat = pl.reshape(ori_kv, [ori_cache_rows, HEAD_DIM])
+    # Staged at the static T_PAD bound: a create_tensor shape derived from the traced token
+    # count cannot cross the sparse_attn_compute parameter boundary.
+    sparse_kv = pl.create_tensor([T_PAD * PREFILL_SPARSE_PAD, HEAD_DIM], dtype=pl.BF16)
+    sparse_bias = pl.create_tensor([T_PAD, PREFILL_SPARSE_PAD], dtype=pl.FP32)
+
+    # Gather sparse sources in reverse token-tile order.
+    with pl.spmd(gather_blocks, name_hint="gather_ori_kv") as gather_ori_tid:
+        gather_schedule_block = pl.tile.get_block_idx()
+        gather_token_block = gather_blocks - 1 - gather_schedule_block
+        gather_t0 = gather_token_block * GATHER_TOKEN_TILE
+        for gather_dt in pl.range(GATHER_TOKEN_TILE):
+            gather_t = gather_t0 + gather_dt
+            if gather_t < t_dim:
+                if gather_t < num_tokens:
+                    block_base = gather_t * PREFILL_SPARSE_PAD
+                    stage = pl.full([PREFILL_ATTN_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
+                    for gather_ki in pl.range(PREFILL_ATTN_TILE):
+                        gather_raw = pl.read(swa_indices, [gather_t, gather_ki])
+                        if gather_raw >= 0:
+                            src = pl.cast(gather_raw, pl.INDEX)
+                            stage[gather_ki:gather_ki + 1, :] = ori_kv_flat[src:src + 1, :]
+                    sparse_kv[block_base:block_base + PREFILL_ATTN_TILE, :] = stage
+
+    cmp_block_num = pl.tensor.dim(cmp_kv, 0)
+    cmp_cache_rows = cmp_block_num * BLOCK_SIZE
+    cmp_kv_flat = pl.reshape(cmp_kv, [cmp_cache_rows, HEAD_DIM])
+    gather_cmp_blocks = gather_blocks * (PREFILL_ATTN_BLOCKS - 1)
+    with pl.spmd(gather_cmp_blocks, name_hint="gather_cmp_kv") as gather_cmp_tid:
+        gather_block = pl.tile.get_block_idx()
+        gather_schedule_block = gather_block // (PREFILL_ATTN_BLOCKS - 1)
+        gather_token_block = gather_blocks - 1 - gather_schedule_block
+        gather_sb = gather_block - gather_schedule_block * (PREFILL_ATTN_BLOCKS - 1) + 1
+        gather_t0 = gather_token_block * GATHER_TOKEN_TILE
+        gather_k0 = gather_sb * PREFILL_ATTN_TILE
+        for gather_dt in pl.range(GATHER_TOKEN_TILE):
+            gather_t = gather_t0 + gather_dt
+            if gather_t < t_dim:
+                if gather_t < num_tokens:
+                    gather_block_valid = pl.read(valid_block_mask, [gather_t, gather_sb])
+                    if gather_block_valid > 0:
+                        block_base = gather_t * PREFILL_SPARSE_PAD + gather_k0
+                        stage = pl.full([PREFILL_ATTN_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
+                        for gather_ki in pl.range(PREFILL_ATTN_TILE):
+                            gather_cmp_k = gather_k0 + gather_ki - WIN
+                            if gather_cmp_k < IDX_TOPK:
+                                gather_raw = pl.read(cmp_indices, [gather_t, gather_cmp_k])
+                                if gather_raw >= 0:
+                                    cmp_slot = gather_raw
+                                    blk_slot = cmp_slot // BLOCK_SIZE
+                                    blk = pl.cast(pl.read(cmp_block_table, [blk_slot]), pl.INDEX)
+                                    src = blk * BLOCK_SIZE + (cmp_slot - blk_slot * BLOCK_SIZE)
+                                    stage[gather_ki:gather_ki + 1, :] = cmp_kv_flat[src:src + 1, :]
+                        sparse_kv[block_base:block_base + PREFILL_ATTN_TILE, :] = stage
+
+    with pl.spmd(t_dim // BIAS_TOKEN_TILE, name_hint="build_bias") as bias_tid:
+        bias_blk = pl.tile.get_block_idx()
+        bias_t0 = bias_blk * BIAS_TOKEN_TILE
+        bias_win_rows = swa_indices[bias_t0:bias_t0 + BIAS_TOKEN_TILE, 0:WIN]
+        bias_win_idx = pl.cast(bias_win_rows, target_type=pl.FP32)
+        bias_win_raw_flag = pl.minimum(pl.maximum(pl.add(bias_win_idx, 1.0), 0.0), 1.0)
+        bias_win = pl.mul(pl.sub(bias_win_raw_flag, 1.0), -FP32_NEG_INF)
+        sparse_bias[bias_t0:bias_t0 + BIAS_TOKEN_TILE, 0:WIN] = bias_win
+        if SPARSE_CMP_BIAS_COLS > 0:
+            bias_cmp_rows = cmp_indices[bias_t0:bias_t0 + BIAS_TOKEN_TILE, 0:SPARSE_CMP_BIAS_COLS]
+            bias_cmp_idx = pl.cast(bias_cmp_rows, target_type=pl.FP32)
+            bias_cmp_raw_flag = pl.minimum(pl.maximum(pl.add(bias_cmp_idx, 1.0), 0.0), 1.0)
+            bias_cmp = pl.mul(pl.sub(bias_cmp_raw_flag, 1.0), -FP32_NEG_INF)
+            sparse_bias[bias_t0:bias_t0 + BIAS_TOKEN_TILE, WIN:SPARSE_BIAS_COLS] = bias_cmp
+        if PREFILL_SPARSE_PAD > SPARSE_BIAS_COLS:
+            bias_pad_cols = PREFILL_SPARSE_PAD - SPARSE_BIAS_COLS
+            bias_pad = pl.full([BIAS_TOKEN_TILE, bias_pad_cols], dtype=pl.FP32, value=FP32_NEG_INF)
+            sparse_bias[bias_t0:bias_t0 + BIAS_TOKEN_TILE, SPARSE_BIAS_COLS:PREFILL_SPARSE_PAD] = bias_pad
+
 
     o_packed_heads = pl.reshape(o_packed, [T_PAD * H, HEAD_DIM])
     # merge_tid is carried out through an array: a TaskId cannot cross a closed scope.
@@ -272,7 +354,7 @@ def sparse_attn_core(
 
 @pl.jit.inline(auto_scope=False)
 def o_proj(
-    o_packed: pl.Tensor[[T_PAD, H * HEAD_DIM], pl.BF16],
+    o_packed: pl.Tensor[[T_PAD, O_GROUPS_LOC * O_GROUP_IN], pl.BF16],
     wo_a: pl.Tensor[[O_GROUPS_LOC, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[D, O_GROUPS_LOC * O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
@@ -425,90 +507,14 @@ def sparse_attn(
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     attn_out: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
 ):
-    """Stage sparse sources and per-token bias, then run the sparse-attention math."""
-    t_dim = pl.tensor.dim(q, 0)
-    gather_blocks = (t_dim + GATHER_TOKEN_TILE - 1) // GATHER_TOKEN_TILE
-    ori_block_num = pl.tensor.dim(ori_kv, 0)
-    ori_cache_rows = ori_block_num * BLOCK_SIZE
-    ori_kv_flat = pl.reshape(ori_kv, [ori_cache_rows, HEAD_DIM])
-    # Staged at the static T_PAD bound: a create_tensor shape derived from the traced token
-    # count cannot cross the sparse_attn_compute parameter boundary.
-    sparse_kv = pl.create_tensor([T_PAD * PREFILL_SPARSE_PAD, HEAD_DIM], dtype=pl.BF16)
-    sparse_bias = pl.create_tensor([T_PAD, PREFILL_SPARSE_PAD], dtype=pl.FP32)
-
-    # Gather sparse sources in reverse token-tile order.
-    with pl.spmd(gather_blocks, name_hint="gather_ori_kv") as gather_ori_tid:
-        gather_schedule_block = pl.tile.get_block_idx()
-        gather_token_block = gather_blocks - 1 - gather_schedule_block
-        gather_t0 = gather_token_block * GATHER_TOKEN_TILE
-        for gather_dt in pl.range(GATHER_TOKEN_TILE):
-            gather_t = gather_t0 + gather_dt
-            if gather_t < t_dim:
-                if gather_t < num_tokens:
-                    block_base = gather_t * PREFILL_SPARSE_PAD
-                    stage = pl.full([PREFILL_ATTN_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
-                    for gather_ki in pl.range(PREFILL_ATTN_TILE):
-                        gather_raw = pl.read(swa_indices, [gather_t, gather_ki])
-                        if gather_raw >= 0:
-                            src = pl.cast(gather_raw, pl.INDEX)
-                            stage[gather_ki:gather_ki + 1, :] = ori_kv_flat[src:src + 1, :]
-                    sparse_kv[block_base:block_base + PREFILL_ATTN_TILE, :] = stage
-
-    cmp_block_num = pl.tensor.dim(cmp_kv, 0)
-    cmp_cache_rows = cmp_block_num * BLOCK_SIZE
-    cmp_kv_flat = pl.reshape(cmp_kv, [cmp_cache_rows, HEAD_DIM])
-    gather_cmp_blocks = gather_blocks * (PREFILL_ATTN_BLOCKS - 1)
-    with pl.spmd(gather_cmp_blocks, name_hint="gather_cmp_kv") as gather_cmp_tid:
-        gather_block = pl.tile.get_block_idx()
-        gather_schedule_block = gather_block // (PREFILL_ATTN_BLOCKS - 1)
-        gather_token_block = gather_blocks - 1 - gather_schedule_block
-        gather_sb = gather_block - gather_schedule_block * (PREFILL_ATTN_BLOCKS - 1) + 1
-        gather_t0 = gather_token_block * GATHER_TOKEN_TILE
-        gather_k0 = gather_sb * PREFILL_ATTN_TILE
-        for gather_dt in pl.range(GATHER_TOKEN_TILE):
-            gather_t = gather_t0 + gather_dt
-            if gather_t < t_dim:
-                if gather_t < num_tokens:
-                    gather_block_valid = pl.read(valid_block_mask, [gather_t, gather_sb])
-                    if gather_block_valid > 0:
-                        block_base = gather_t * PREFILL_SPARSE_PAD + gather_k0
-                        stage = pl.full([PREFILL_ATTN_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
-                        for gather_ki in pl.range(PREFILL_ATTN_TILE):
-                            gather_cmp_k = gather_k0 + gather_ki - WIN
-                            if gather_cmp_k < IDX_TOPK:
-                                gather_raw = pl.read(cmp_indices, [gather_t, gather_cmp_k])
-                                if gather_raw >= 0:
-                                    cmp_slot = gather_raw
-                                    blk_slot = cmp_slot // BLOCK_SIZE
-                                    blk = pl.cast(pl.read(cmp_block_table, [blk_slot]), pl.INDEX)
-                                    src = blk * BLOCK_SIZE + (cmp_slot - blk_slot * BLOCK_SIZE)
-                                    stage[gather_ki:gather_ki + 1, :] = cmp_kv_flat[src:src + 1, :]
-                        sparse_kv[block_base:block_base + PREFILL_ATTN_TILE, :] = stage
-
-    with pl.spmd(t_dim // BIAS_TOKEN_TILE, name_hint="build_bias") as bias_tid:
-        bias_blk = pl.tile.get_block_idx()
-        bias_t0 = bias_blk * BIAS_TOKEN_TILE
-        bias_win_rows = swa_indices[bias_t0:bias_t0 + BIAS_TOKEN_TILE, 0:WIN]
-        bias_win_idx = pl.cast(bias_win_rows, target_type=pl.FP32)
-        bias_win_raw_flag = pl.minimum(pl.maximum(pl.add(bias_win_idx, 1.0), 0.0), 1.0)
-        bias_win = pl.mul(pl.sub(bias_win_raw_flag, 1.0), -FP32_NEG_INF)
-        sparse_bias[bias_t0:bias_t0 + BIAS_TOKEN_TILE, 0:WIN] = bias_win
-        if SPARSE_CMP_BIAS_COLS > 0:
-            bias_cmp_rows = cmp_indices[bias_t0:bias_t0 + BIAS_TOKEN_TILE, 0:SPARSE_CMP_BIAS_COLS]
-            bias_cmp_idx = pl.cast(bias_cmp_rows, target_type=pl.FP32)
-            bias_cmp_raw_flag = pl.minimum(pl.maximum(pl.add(bias_cmp_idx, 1.0), 0.0), 1.0)
-            bias_cmp = pl.mul(pl.sub(bias_cmp_raw_flag, 1.0), -FP32_NEG_INF)
-            sparse_bias[bias_t0:bias_t0 + BIAS_TOKEN_TILE, WIN:SPARSE_BIAS_COLS] = bias_cmp
-        if PREFILL_SPARSE_PAD > SPARSE_BIAS_COLS:
-            bias_pad_cols = PREFILL_SPARSE_PAD - SPARSE_BIAS_COLS
-            bias_pad = pl.full([BIAS_TOKEN_TILE, bias_pad_cols], dtype=pl.FP32, value=FP32_NEG_INF)
-            sparse_bias[bias_t0:bias_t0 + BIAS_TOKEN_TILE, SPARSE_BIAS_COLS:PREFILL_SPARSE_PAD] = bias_pad
-
+    """Attention core chained straight into the projection over every group."""
     # Token-major, head-minor: group g is the column band [g*O_GROUP_IN, (g+1)*O_GROUP_IN),
     # so a proj_a K-frag is the same tile shape as under a group-major layout.
     o_packed = pl.create_tensor([T_PAD, H * HEAD_DIM], dtype=pl.BF16)
     merge_dep = sparse_attn_core(
-        q, sparse_kv, sparse_bias, valid_block_mask, attn_sink,
+        q, ori_kv, swa_indices,
+        cmp_kv, cmp_block_table, cmp_indices,
+        valid_block_mask, attn_sink,
         freqs_cos, freqs_sin,
         o_packed, num_tokens,
     )
