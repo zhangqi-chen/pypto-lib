@@ -365,7 +365,7 @@ def golden_prefill_indexer_core(tensors):
     import torch
 
     compressor_tensors = {
-        "x": tensors["x"],
+        "x": tensors["x_full"],
         "kv": torch.zeros(MAX_CMP_WRITES, IDX_HEAD_DIM, dtype=torch.bfloat16),
         "compress_state": tensors["inner_compress_state"],
         "inner_compress_state_block_table": tensors["inner_compress_state_block_table"],
@@ -394,11 +394,13 @@ def golden_prefill_indexer_core(tensors):
     # W8A8C16 int8 path, causal-mask each token to the positions it can reach ((pos+1)//ratio),
     # then top-k. Replaces the old placeholder (sequential arange+offset, i.e. the dense
     # get_compress_topk_idxs pattern, which never exercised real selection).
-    num_tokens = int(tensors["num_tokens"])
-    position_ids = tensors["position_ids"].long()
+    # The query side follows the caller's LOCAL rows; the compressor above ran the full run.
+    t_loc = tensors["qr"].shape[0]
+    num_tokens = int(tensors["num_tokens_local"])
+    position_ids = tensors["position_ids_local"].long()
     rd = ROPE_HEAD_DIM
-    cmp_topk_indices = torch.full((T, IDX_TOPK), -1, dtype=torch.int32)
-    score_full = torch.full((T, INDEXER_SCORE_CAP), FP32_NEG_INF, dtype=torch.float32)
+    cmp_topk_indices = torch.full((t_loc, IDX_TOPK), -1, dtype=torch.int32)
+    score_full = torch.full((t_loc, INDEXER_SCORE_CAP), FP32_NEG_INF, dtype=torch.float32)
     visible = ((position_ids + 1) // COMPRESS_RATIO).clamp(max=INDEXER_SCORE_CAP)
     max_visible = int(visible[:num_tokens].max().item()) if num_tokens > 0 else 0
     if max_visible == 0:
@@ -410,10 +412,10 @@ def golden_prefill_indexer_core(tensors):
     wq_b = tensors["wq_b"]
     wq_b_scale = tensors["wq_b_scale"].float()
     hadamard = tensors["hadamard"].float()
-    cos = tensors["cos"].float().view(T, 1, -1)
-    sin = tensors["sin"].float().view(T, 1, -1)
+    cos = tensors["cos"].float().view(t_loc, 1, -1)
+    sin = tensors["sin"].float().view(t_loc, 1, -1)
     q_i32 = qr.to(torch.int32) @ wq_b.to(torch.int32)
-    q = (q_i32.float() * qr_scale * wq_b_scale.view(1, -1)).view(T, IDX_N_HEADS, IDX_HEAD_DIM)
+    q = (q_i32.float() * qr_scale * wq_b_scale.view(1, -1)).view(t_loc, IDX_N_HEADS, IDX_HEAD_DIM)
     q_pair = q[..., -rd:].unflatten(-1, (-1, 2))
     q0, q1 = q_pair[..., 0], q_pair[..., 1]
     y0 = (q0 * cos - q1 * sin).to(torch.bfloat16)
@@ -421,7 +423,7 @@ def golden_prefill_indexer_core(tensors):
     q = torch.cat([q[..., :-rd], torch.stack([y0, y1], dim=-1).flatten(-2)], dim=-1)
     q = q.to(torch.bfloat16).float() @ hadamard
 
-    weights = (tensors["x"].float() @ tensors["weights_proj"].float()) * WEIGHTS_SCALE  # [T, heads]
+    weights = (tensors["x_local"].float() @ tensors["weights_proj"].float()) * WEIGHTS_SCALE
 
     # C8: the compressor already stored INT8 KV + a per-position dequant scale. Gather both in
     # compressed-position order through the paged block table (no score-time re-quant).
@@ -437,9 +439,9 @@ def golden_prefill_indexer_core(tensors):
 
     # W8A8C16 int8 score, matching decode_indexer: per-row quantize q, INT32 matmul against the
     # pre-quantized KV, then dequantize by both scales before the FP32 head-weighted reduce.
-    q_i8, q_sc = int8_quant_per_row(q.reshape(T * IDX_N_HEADS, IDX_HEAD_DIM))
-    q_i8 = q_i8.view(T, IDX_N_HEADS, IDX_HEAD_DIM).to(torch.int32)
-    q_sc = q_sc.view(T, IDX_N_HEADS, 1)
+    q_i8, q_sc = int8_quant_per_row(q.reshape(t_loc * IDX_N_HEADS, IDX_HEAD_DIM))
+    q_i8 = q_i8.view(t_loc, IDX_N_HEADS, IDX_HEAD_DIM).to(torch.int32)
+    q_sc = q_sc.view(t_loc, IDX_N_HEADS, 1)
     score_i32 = torch.einsum("thd,cd->thc", q_i8, kv_i8)
     score = score_i32.float() * q_sc * kv_sc
     score = (torch.relu(score) * weights.unsqueeze(-1)).sum(dim=1)  # [T, max_visible]
@@ -459,7 +461,11 @@ def golden_prefill_indexer_core(tensors):
 def golden_prefill_indexer(tensors):
     import torch
 
-    cmp_topk_indices, score_full = golden_prefill_indexer_core(tensors)
+    core = dict(tensors)
+    core["x_local"] = core["x_full"] = tensors["x"]
+    core["position_ids_local"] = tensors["position_ids"]
+    core["num_tokens_local"] = tensors["num_tokens"]
+    cmp_topk_indices, score_full = golden_prefill_indexer_core(core)
     topk_idxs = torch.full((T, INDEXER_SCORE_CAP), -1, dtype=torch.int32)
     compare_cols = min(IDX_TOPK, INDEXER_SCORE_CAP)
     topk_idxs[:, 0:compare_cols] = cmp_topk_indices[:, 0:compare_cols]
@@ -712,13 +718,16 @@ def build_tensor_specs(start_pos: int = START_POS, num_tokens: int = T):
 
 
 def topk_prefix_contract_error(topk_indices, position_ids, num_tokens):
-    """Return an error string if the top-k prefix contract is broken."""
+    """Return an error string if the top-k prefix contract is broken.
+
+    Rows follow the caller's tensor, so a CP caller can pass its own T_LOC slice.
+    """
     import torch
 
     if hasattr(num_tokens, "item"):
         num_tokens = num_tokens.item()
     num_tokens = int(num_tokens)
-    for t in range(T):
+    for t in range(topk_indices.shape[0]):
         row = topk_indices[t]
         if t >= num_tokens:
             non_padding = int((row != -1).count_nonzero().item())

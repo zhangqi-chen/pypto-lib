@@ -455,7 +455,10 @@ def golden_prefill_attention_csa(tensors):
     idx_cos = rope_cos_t[:, :HALF_ROPE].float().contiguous()
     idx_sin = rope_sin_t[:, :HALF_ROPE].float().contiguous()
     cmp_topk_indices, _idx_score = golden_prefill_indexer_core({
-        "x": x_normed.view(T, D),
+        "x_local": x_normed.view(T, D),
+        "x_full": x_normed.view(T, D),
+        "position_ids_local": tensors["position_ids"],
+        "num_tokens_local": tensors["num_tokens"],
         "qr": qr,
         "qr_scale": qr_scale,
         "wq_b": tensors["idx_wq_b"],
