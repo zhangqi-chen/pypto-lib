@@ -746,28 +746,6 @@ def build_tensor_specs(start_pos: int = START_POS, num_tokens: int = T):
     ]
 
 
-def cp_valid_ratio_reldiff(num_tokens: int, diff_thd: float, pct_thd: float, max_diff_hd: float):
-    """Relative-diff comparator over each rank's leading ``num_tokens`` rows."""
-    from golden import ratio_reldiff
-
-    base_cmp = ratio_reldiff(diff_thd=diff_thd, pct_thd=pct_thd, max_diff_hd=max_diff_hd)
-    token_axis = 1
-
-    def cmp(actual, expected, *, actual_outputs, expected_outputs, inputs, rtol, atol):
-        tail_actual = actual.narrow(token_axis, num_tokens, actual.shape[token_axis] - num_tokens)
-        tail_nonzero = int(tail_actual.count_nonzero().item())
-        if tail_nonzero:
-            return False, f"    inactive x_out tail contains {tail_nonzero} nonzero values"
-        return base_cmp(
-            actual.narrow(token_axis, 0, num_tokens), expected.narrow(token_axis, 0, num_tokens),
-            actual_outputs=actual_outputs, expected_outputs=expected_outputs,
-            inputs=inputs, rtol=rtol, atol=atol,
-        )
-
-    cmp.__name__ = f"cp_valid_ratio_reldiff(num_tokens={num_tokens})"
-    return cmp
-
-
 def cp_replica_allclose(atol: float, rtol: float):
     """kv_cache comparator: the CP copies agree with each other, then match the reference.
 
@@ -802,7 +780,7 @@ if __name__ == "__main__":
     import argparse
     from pypto.ir.distributed_compiled_program import DistributedConfig
 
-    from golden import run_jit
+    from golden import ratio_reldiff, run_jit
 
     parser = argparse.ArgumentParser(description="DeepSeek V4 context-parallel prefill SWA test.")
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -843,7 +821,8 @@ if __name__ == "__main__":
         rtol=1e-2,
         atol=1e-2,
         compare_fn={
-            "x_out": cp_valid_ratio_reldiff(compare_tokens, diff_thd=3e-3, pct_thd=0.005, max_diff_hd=1),
+            "x_out": ratio_reldiff(diff_thd=3e-3, pct_thd=0.005, max_diff_hd=1,
+                                   valid_rows=compare_tokens, valid_axis=1, zero_tail=True),
             "kv_cache": cp_replica_allclose(atol=1e-4, rtol=1e-2),
         },
     )

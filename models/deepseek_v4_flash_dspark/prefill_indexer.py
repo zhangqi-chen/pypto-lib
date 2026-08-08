@@ -360,46 +360,6 @@ def prefill_indexer(
     return idx_kv_cache_out, idx_kv_scale_out, score, cmp_topk_indices
 
 
-def topk_prefix_contract_error(topk_indices, position_ids, num_tokens):
-    """Return an error string if the top-k prefix contract is broken."""
-    import torch
-
-    if hasattr(num_tokens, "item"):
-        num_tokens = num_tokens.item()
-    num_tokens = int(num_tokens)
-    for t in range(T):
-        row = topk_indices[t]
-        if t >= num_tokens:
-            non_padding = int((row != -1).count_nonzero().item())
-            if non_padding:
-                return f"inactive top-k row {t} contains {non_padding} non--1 entries"
-            continue
-        visible = min(
-            int((int(position_ids[t].item()) + 1) // COMPRESS_RATIO),
-            INDEXER_TOPK_CAP,
-        )
-        prefix = row[:visible]
-        if visible:
-            out_of_range = int(
-                ((prefix < 0) | (prefix >= visible)).count_nonzero().item()
-            )
-            if out_of_range:
-                return (
-                    f"top-k row {t} has {out_of_range} entries outside "
-                    f"[0, {visible}) in its visible prefix"
-                )
-            unique_count = int(torch.unique(prefix).numel())
-            if unique_count != visible:
-                return (
-                    f"top-k row {t} visible prefix has "
-                    f"{unique_count}/{visible} unique entries"
-                )
-        tail_non_padding = int((row[visible:] != -1).count_nonzero().item())
-        if tail_non_padding:
-            return f"top-k row {t} tail contains {tail_non_padding} non--1 entries"
-    return None
-
-
 def golden_prefill_indexer_core(tensors):
     from utils import int8_quant_per_row
     import torch
@@ -751,6 +711,46 @@ def build_tensor_specs(start_pos: int = START_POS, num_tokens: int = T):
     ]
 
 
+def topk_prefix_contract_error(topk_indices, position_ids, num_tokens):
+    """Return an error string if the top-k prefix contract is broken."""
+    import torch
+
+    if hasattr(num_tokens, "item"):
+        num_tokens = num_tokens.item()
+    num_tokens = int(num_tokens)
+    for t in range(T):
+        row = topk_indices[t]
+        if t >= num_tokens:
+            non_padding = int((row != -1).count_nonzero().item())
+            if non_padding:
+                return f"inactive top-k row {t} contains {non_padding} non--1 entries"
+            continue
+        visible = min(
+            int((int(position_ids[t].item()) + 1) // COMPRESS_RATIO),
+            INDEXER_TOPK_CAP,
+        )
+        prefix = row[:visible]
+        if visible:
+            out_of_range = int(
+                ((prefix < 0) | (prefix >= visible)).count_nonzero().item()
+            )
+            if out_of_range:
+                return (
+                    f"top-k row {t} has {out_of_range} entries outside "
+                    f"[0, {visible}) in its visible prefix"
+                )
+            unique_count = int(torch.unique(prefix).numel())
+            if unique_count != visible:
+                return (
+                    f"top-k row {t} visible prefix has "
+                    f"{unique_count}/{visible} unique entries"
+                )
+        tail_non_padding = int((row[visible:] != -1).count_nonzero().item())
+        if tail_non_padding:
+            return f"top-k row {t} tail contains {tail_non_padding} non--1 entries"
+    return None
+
+
 if __name__ == "__main__":
     import argparse
     import torch
@@ -770,29 +770,27 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     def topk_idxs_compare(actual, expected, *, actual_outputs, expected_outputs, inputs, rtol, atol):
-        score = actual_outputs["score"]
-        a_top = actual[..., :IDX_TOPK]
-        e_top = expected[..., :IDX_TOPK]
-        contract_error = topk_prefix_contract_error(
-            a_top,
-            inputs["position_ids"],
-            args.num_tokens,
-        )
+        """Structural contract check, then a tie-tolerant index compare.
+
+        topk_pair_compare needs the score of the candidate picked at each RANK, but the kernel
+        emits ``score`` indexed by compressed SLOT. The gather converts the axis:
+        ``paired[t, r] = score[t, topk_idxs[t, r]]``, -inf where the rank holds no candidate.
+        """
+        contract_error = topk_prefix_contract_error(actual, inputs["position_ids"], args.num_tokens)
         if contract_error:
             return False, f"    {contract_error}"
-        invalid_top = a_top < 0
-        a_orig = a_top.long().clamp(min=0, max=score.shape[-1] - 1)
-        paired = torch.gather(score, dim=-1, index=a_orig)
-        paired = torch.where(invalid_top, torch.full_like(paired, -torch.inf), paired)
+        score = actual_outputs["score"]
+        slot_of_rank = actual.long().clamp(min=0, max=score.shape[-1] - 1)
+        paired = torch.gather(score, dim=-1, index=slot_of_rank)
+        paired = torch.where(actual < 0, torch.full_like(paired, -torch.inf), paired)
         synth_actual = {**actual_outputs, "_topk_paired_scores": paired}
         return topk_pair_compare("_topk_paired_scores")(
-            a_top, e_top,
+            actual, expected,
             actual_outputs=synth_actual,
             expected_outputs=expected_outputs,
             inputs=inputs,
             rtol=rtol, atol=atol,
         )
-    topk_idxs_compare.__name__ = "topk_pair_compare"
 
     result = run_jit(
         fn=prefill_indexer_test,
