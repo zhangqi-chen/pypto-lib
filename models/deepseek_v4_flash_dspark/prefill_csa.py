@@ -236,16 +236,16 @@ def prefill_attention_csa(
 
     cmp_topk_indices = pl.create_tensor([T, IDX_TOPK], dtype=pl.INT32)
     idx_score_unused = pl.create_tensor([T, INDEXER_SCORE_CAP], dtype=pl.FP32)
+    # Non-CP: the query side and the cache update share the same token run.
     idx_kv_cache_out, idx_kv_scale_out, idx_score_unused, cmp_topk_indices = prefill_indexer(
-        x_normed, qr, qr_scale,
+        x_normed, qr, qr_scale, idx_cos, idx_sin, position_ids, num_tokens,
+        x_normed, position_ids, num_tokens, idx_slot_mapping, inner_state_slot_mapping,
         idx_wq_b, idx_wq_b_scale, idx_weights_proj,
-        idx_cos, idx_sin, freqs_cos,
-        freqs_sin, hadamard_idx, inner_compress_state,
-        inner_compress_state_block_table, inner_wkv, inner_wgate,
-        inner_ape, inner_norm_w, idx_kv_cache,
-        idx_kv_scale, idx_block_table, idx_score_unused,
-        cmp_topk_indices, position_ids, num_tokens,
-        idx_slot_mapping, inner_state_slot_mapping,
+        freqs_cos, freqs_sin, hadamard_idx,
+        inner_compress_state, inner_compress_state_block_table,
+        inner_wkv, inner_wgate, inner_ape, inner_norm_w,
+        idx_kv_cache, idx_kv_scale, idx_block_table,
+        idx_score_unused, cmp_topk_indices,
     )
 
     swa_indices = pl.create_tensor([T, WIN], dtype=pl.INT32)
