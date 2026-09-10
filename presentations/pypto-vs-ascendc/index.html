@@ -347,7 +347,7 @@
   <main>
     <header>
       <h1>PyPTO3.0阶段报告</h1>
-      <p class="report-date">2026年8月</p>
+      <p class="report-date">2026年9月</p>
     </header>
 
     <section>
@@ -477,7 +477,7 @@
                   <th class="metric">算子 / 指标</th>
                   <th>PyPTO</th>
                   <th>AscendC</th>
-                  <th>PyPTO / AscendC</th>
+                  <th>相对性能</th>
                 </tr>
               </thead>
               <tbody>
@@ -486,14 +486,14 @@
                   <td class="metric">Decode Layer</td>
                   <td>908 μs</td>
                   <td>885 μs</td>
-                  <td><span class="ratio-warn">1.026</span></td>
+                  <td><span class="ratio-warn">97.5%</span></td>
                 </tr>
                 <tr>
                   <td class="perf-type">推理性能<span class="row-note">单 Die，BS=16，SeqLen=128，Output=1024</span></td>
                   <td class="metric">TPOT</td>
                   <td>30.1 ms</td>
                   <td>29.9 ms</td>
-                  <td><span class="ratio-warn">1.007</span></td>
+                  <td><span class="ratio-warn">99.3%</span></td>
                 </tr>
               </tbody>
             </table>
@@ -510,7 +510,7 @@
                   <th class="metric">算子 / 指标</th>
                   <th>PyPTO</th>
                   <th>AscendC</th>
-                  <th>PyPTO / AscendC</th>
+                  <th>相对性能</th>
                 </tr>
               </thead>
               <tbody>
@@ -522,47 +522,53 @@
                   <td class="metric">Attention CSA</td>
                   <td>351 μs</td>
                   <td>465 μs</td>
-                  <td><span class="ratio-good">0.755</span></td>
+                  <td><span class="ratio-good">132.5%</span></td>
                 </tr>
                 <tr>
                   <td class="metric">Attention HCA</td>
                   <td>261 μs</td>
                   <td>307 μs</td>
-                  <td><span class="ratio-good">0.850</span></td>
+                  <td><span class="ratio-good">117.6%</span></td>
                 </tr>
                 <tr>
                   <td class="metric">Attention SWA</td>
                   <td>245 μs</td>
                   <td>280 μs</td>
-                  <td><span class="ratio-good">0.875</span></td>
+                  <td><span class="ratio-good">114.3%</span></td>
                 </tr>
                 <tr>
                   <td class="metric">MoE</td>
                   <td>474 μs</td>
                   <td>479 μs</td>
-                  <td><span class="ratio-good">0.990</span></td>
+                  <td><span class="ratio-good">101.1%</span></td>
                 </tr>
                 <tr>
                   <td class="metric">Decode Main</td>
                   <td>35.6 ms</td>
                   <td>37.7 ms</td>
-                  <td><span class="ratio-good">0.944</span></td>
+                  <td><span class="ratio-good">105.9%</span></td>
                 </tr>
                 <tr>
                   <td class="metric">Decode MTP</td>
                   <td>1143 μs</td>
                   <td>1268 μs</td>
-                  <td><span class="ratio-good">0.901</span></td>
+                  <td><span class="ratio-good">110.9%</span></td>
                 </tr>
                 <tr>
-                  <td class="perf-type">
+                  <td class="perf-type" rowspan="2">
                     推理性能
                     <span class="row-note">TP=1，DP=EP=8，LM Head TP=4，GBS=8×4，SeqLen=64，MTP=1，Output=256</span>
                   </td>
-                  <td class="metric">TPOT (Decode Step)</td>
-                  <td>40.1 ms</td>
-                  <td>56.6 ms</td>
-                  <td><span class="ratio-good">0.709</span></td>
+                  <td class="metric">Decode Step (Host)</td>
+                  <td>41.2 ms</td>
+                  <td>56.4 ms</td>
+                  <td><span class="ratio-good">136.9%</span></td>
+                </tr>
+                <tr>
+                  <td class="metric">Decode Step (Device)</td>
+                  <td>40.2 ms</td>
+                  <td>46.5 ms</td>
+                  <td><span class="ratio-good">115.7%</span></td>
                 </tr>
               </tbody>
             </table>
