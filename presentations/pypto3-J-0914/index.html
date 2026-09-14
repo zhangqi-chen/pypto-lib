@@ -1,0 +1,243 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PyPTO 性能数据汇报</title>
+<style>
+:root{
+  --pp:#7B2FBE; --tl:#1BA3C6;
+  --ink:#12122A; --ink2:#3C4257; --gray:#6B7280; --gray2:#9AA1AE;
+  --red:#E8453C; --good:#1F9D62;
+  --blue-b:#4A90D9; --blue-f:#F1F7FE;
+  --teal-b:#3BB8C4; --teal-f:#EFFAFB;
+  --pur-b:#9B4DD6; --pur-f:#FBF4FE;
+  --han:"PingFang SC","Hiragino Sans GB","Source Han Sans SC","Noto Sans CJK SC","Microsoft YaHei",sans-serif;
+  --lat:"Lato","Segoe UI",-apple-system,BlinkMacSystemFont,Helvetica,Arial,sans-serif;
+  --mono:"SF Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;overflow:hidden;background:#2A2A35}
+body{font-family:var(--lat),var(--han);color:var(--ink);-webkit-font-smoothing:antialiased}
+
+#stage{position:fixed;inset:0;display:grid;place-items:center}
+#deck{width:1333px;height:750px;position:relative;transform-origin:center center;
+  background:#fff;box-shadow:0 8px 60px rgba(0,0,0,.5);overflow:hidden}
+
+.s{position:absolute;inset:0;padding:38px 56px 52px;display:none;flex-direction:column}
+.s.on{display:flex}
+
+/* ---------- decorative background ---------- */
+.bg{position:absolute;inset:0;overflow:hidden;pointer-events:none;z-index:0}
+.wash-bl{position:absolute;width:520px;height:300px;left:-160px;bottom:-190px;opacity:.55;
+  background:radial-gradient(ellipse at 30% 70%,rgba(150,90,220,.42),rgba(150,90,220,0) 62%),
+             radial-gradient(ellipse at 62% 78%,rgba(60,150,230,.40),rgba(60,150,230,0) 60%),
+             radial-gradient(ellipse at 84% 88%,rgba(70,205,215,.34),rgba(70,205,215,0) 58%);
+  filter:blur(18px)}
+.wash-tr{position:absolute;right:-100px;top:-160px;width:360px;height:260px;opacity:.5;
+  background:radial-gradient(ellipse at 70% 40%,rgba(90,200,150,.26),rgba(90,200,150,0) 62%);
+  filter:blur(16px)}
+
+/* ---------- slide chrome ---------- */
+h3.t{font-family:var(--han);font-size:35px;font-weight:800;letter-spacing:-.3px;line-height:1.2;
+  z-index:2;position:relative;padding-right:20px;flex:0 0 auto;align-self:flex-start;
+  background:linear-gradient(96deg,#7B2FBE 0%,#8B3DD6 26%,#4A7DD4 58%,#1BA3C6 84%,#2ABBB0 100%);
+  -webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+.body{flex:1 1 auto;display:flex;flex-direction:column;gap:14px;z-index:2;position:relative;
+  margin-top:18px;min-height:0;justify-content:center}
+.foot{position:absolute;left:56px;right:56px;bottom:20px;display:flex;align-items:center;
+  justify-content:space-between;z-index:3;font-family:var(--han);font-size:13px;letter-spacing:.4px}
+.foot .nav{color:var(--pp);font-weight:800}
+.foot .pg{color:var(--gray2);font-size:13px;font-family:var(--lat)}
+
+/* ---------- cards ---------- */
+.row{display:flex;gap:16px;align-items:stretch}
+.row>*{flex:1 1 0;min-width:0}
+.card{border:2px solid #D4D8DF;background:#F7F8FA;border-radius:15px;
+  padding:14px 17px;display:flex;flex-direction:column;gap:10px;min-width:0}
+.card.blue{border-color:var(--blue-b);background:var(--blue-f)}
+.card.teal{border-color:var(--teal-b);background:var(--teal-f)}
+.card h4{font-family:var(--han);font-size:17px;font-weight:800;display:flex;align-items:center;gap:10px;color:var(--ink)}
+.card h4 .tag{font-family:var(--lat);font-size:10.5px;font-weight:800;letter-spacing:1.1px;
+  padding:2px 7px;border-radius:5px;background:#fff;border:1px solid currentColor}
+.card.blue h4 .tag{color:var(--blue-b)} .card.teal h4 .tag{color:var(--teal-b)}
+.card p{font-family:var(--han);font-size:15px;line-height:1.6;color:var(--ink2)}
+
+/* ---------- checklist ---------- */
+.card .goal{font-family:var(--han);font-size:14px;line-height:1.55;color:var(--ink2)}
+.grp{display:flex;flex-direction:column;gap:6px}
+.grp .gh{font-family:var(--han);font-size:13px;font-weight:800;color:var(--gray);letter-spacing:.6px}
+.chk{list-style:none;display:flex;flex-direction:column;gap:6px}
+.chk li{display:flex;align-items:baseline;gap:9px;background:#fff;border:1.5px solid #E6E9EF;border-radius:9px;
+  padding:7px 12px;font-family:var(--han);font-size:14.5px;line-height:1.45;color:var(--ink)}
+.chk li::before{content:"✓";flex:0 0 auto;font-family:var(--lat);font-weight:900;color:var(--good)}
+.chk li small{font-size:12.5px;color:var(--gray);margin-left:2px}
+.chk li.wip{border-color:#F0D9A8}
+.stack{display:flex;flex-direction:column;gap:14px}
+.stack .grp{flex-direction:row;align-items:center;gap:12px}
+.stack .grp .gh{flex:0 0 76px}
+.stack .chk{flex:1;flex-direction:row;flex-wrap:wrap;gap:8px}
+.chk li.wip::before{content:"!";color:#C08A1E;width:.6em;text-align:center}
+.chk li.wip small{color:#A0701A}
+
+/* ---------- todo ---------- */
+.todo{z-index:2;position:relative;font-family:var(--han);font-size:15px;line-height:1.7;color:var(--ink2);padding:0 4px}
+.todo b{color:var(--ink)}
+/* ---------- tables ---------- */
+.tw{border:2px solid #E6E9EF;border-radius:13px;overflow:hidden;background:#fff}
+table{width:100%;border-collapse:collapse;font-family:var(--han);font-size:13px}
+th,td{text-align:left;padding:7px 10px;border-bottom:1px solid #E6E9EF;color:var(--ink2);vertical-align:middle}
+thead th{font-size:11.5px;font-weight:800;letter-spacing:.6px;color:var(--pp);
+  border-bottom:2px solid #E0D6F0;background:#FBF8FE;white-space:nowrap}
+thead th.n{text-align:right}
+tbody tr:last-child td{border-bottom:none}
+td.ty{font-weight:800;color:var(--ink);vertical-align:top;width:132px;border-right:1px solid #E6E9EF;background:#FCFCFD}
+td.ty small{display:block;margin-top:3px;font-family:var(--han);font-size:10.5px;font-weight:400;color:var(--gray);line-height:1.45}
+td.m{color:var(--ink);font-weight:600;white-space:nowrap}
+td.n{font-family:var(--mono);font-variant-numeric:tabular-nums;text-align:right;color:var(--ink);white-space:nowrap}
+td.na{color:var(--gray2)}
+.good{color:var(--good);font-weight:800}
+.hint{font-family:var(--han);font-size:12.5px;color:var(--gray2);font-style:italic}
+.hint b{font-style:normal;color:var(--ink2)}
+.take{text-align:center;font-family:var(--han);font-size:16px;color:var(--ink2);font-style:italic}
+.take b{font-style:normal;color:var(--pp)}
+
+@media (prefers-reduced-motion:no-preference){#deck{transition:transform .12s ease-out}}
+</style>
+</head>
+<body>
+
+<div id="stage"><div id="deck">
+<section class="s">
+  <div class="bg"><div class="wash-bl"></div><div class="wash-tr"></div></div>
+  <h3 class="t">PyPTO3.0部署目标</h3>
+  <div class="body">
+    <div class="stack">
+
+      <!-- left: goal 1 -->
+      <div class="card blue">
+        <h4><span class="tag">目标一</span>黄区 Serving 部署 · dsv4-flash · A3</h4>
+        <p class="goal">上线黄区 serving 部署，提供 API 接入能力。</p>
+        <div class="grp">
+          <span class="gh">关键功能</span>
+          <ul class="chk">
+            <li>TP4 × DP4 + EP16 部署方案</li>
+            <li>Prefix Cache</li>
+            <li>CP 并行与多 Chunk Size</li>
+          </ul>
+        </div>
+        <div class="grp">
+          <span class="gh">部署验证</span>
+          <ul class="chk">
+            <li>黄区 pypto Serving 服务 E2E 部署</li>
+            <li class="wip">数据集精度评测<small>单 batch 验证通过；多 batch 输入大小不一致时仍有问题，修复后进行数据集验证</small></li>
+            <li class="wip">vllm-ascend docker 验证</li>
+          </ul>
+        </div>
+      </div>
+
+      <!-- right: goal 2 -->
+      <div class="card teal">
+        <h4><span class="tag">目标二</span>补齐泛化功能 · dsv4-flash · A3</h4>
+        <p class="goal">维持关键指标场景 AscendC 极致性能的前提下，补齐各种泛化功能。</p>
+        <div class="grp">
+          <span class="gh">Decode</span>
+          <ul class="chk">
+            <li>1M 完整功能</li>
+            <li>局部支持 TP</li>
+            <li>DSpark<small>verify / accept-reject 算子，与目标模型联调</small></li>
+          </ul>
+        </div>
+        <div class="grp">
+          <span class="gh">Prefill</span>
+          <ul class="chk">
+            <li>1M 完整功能</li>
+            <li>CP 基础功能</li>
+            <li>动态 Batch</li>
+          </ul>
+        </div>
+      </div>
+
+    </div>
+  </div>
+  <div class="foot"><div class="nav">进展汇报0914</div><div class="pg">1</div></div>
+</section>
+<section class="s">
+  <div class="bg"><div class="wash-bl"></div><div class="wash-tr"></div></div>
+  <h3 class="t">DeepSeek-V4 Flash 性能数据（A3）</h3>
+  <div class="body">
+    <div class="row">
+
+      <!-- left: vs CANN Recipe -->
+      <div class="card blue">
+        <h4><span class="tag">VS CANN RECIPE</span>DeepSeek-V4-Flash</h4>
+        <div class="tw"><table>
+          <thead><tr><th>类型</th><th>算子 / 指标</th><th class="n">PyPTO</th><th class="n">CANN Recipe</th><th class="n">相对性能</th></tr></thead>
+          <tbody>
+            <tr><td class="ty" rowspan="3">算子性能<small>TP=1，BS per Die=4，SeqLen=8K，MTP=1</small></td>
+              <td class="m">Attention CSA</td><td class="n">349 μs</td><td class="n">465 μs</td><td class="n"><span class="good">133.2%</span></td></tr>
+            <tr><td class="m">Attention HCA</td><td class="n">268 μs</td><td class="n">307 μs</td><td class="n"><span class="good">114.6%</span></td></tr>
+            <tr><td class="m">Attention SWA</td><td class="n">245 μs</td><td class="n">280 μs</td><td class="n"><span class="good">114.3%</span></td></tr>
+            <tr><td class="ty" rowspan="2">推理性能<small>TP=1，DP=EP=8，LM Head TP=4，GBS=8×4，SeqLen=64，MTP=1，Output=256</small></td>
+              <td class="m">Decode Step (Device)</td><td class="n">40.2 ms</td><td class="n">46.5 ms</td><td class="n"><span class="good">115.7%</span></td></tr>
+            <tr><td class="m">Decode Step (Host)</td><td class="n">41.2 ms</td><td class="n">56.4 ms</td><td class="n"><span class="good">136.9%</span></td></tr>
+          </tbody></table></div>
+      </div>
+
+      <!-- right: vs vLLM-Ascend -->
+      <div class="card teal">
+        <h4><span class="tag">VS VLLM-ASCEND</span>DeepSeek-V4-Flash-DSpark</h4>
+        <div class="tw"><table>
+          <thead><tr><th>类型</th><th>算子 / 指标</th><th class="n">PyPTO</th><th class="n">vLLM-Ascend</th><th class="n">相对性能</th></tr></thead>
+          <tbody>
+            <tr><td class="ty" rowspan="3">算子性能<small>TP=4，BS per TP Group=64，SeqLen=64，MTP=7</small></td>
+              <td class="m">Attention CSA</td><td class="n">1060 μs</td><td class="n">1343 μs</td><td class="n"><span class="good">126.7%</span></td></tr>
+            <tr><td class="m">Attention HCA</td><td class="n">683 μs</td><td class="n">932 μs</td><td class="n"><span class="good">136.5%</span></td></tr>
+            <tr><td class="m">Attention SWA</td><td class="n">590 μs</td><td class="n">821 μs</td><td class="n"><span class="good">139.2%</span></td></tr>
+            <tr><td class="ty" rowspan="2">推理性能<small>TP=4，DP=4，EP=16，GBS=256，DSpark on，MTP=7，SeqLen=256，Output=64</small></td>
+              <td class="m">Decode Step (Device)</td><td class="n">145.2 ms</td><td class="n na">—</td><td class="n na">—</td></tr>
+            <tr><td class="m">Decode Step (Host)</td><td class="n">329.4 ms</td><td class="n na">—</td><td class="n na">—</td></tr>
+          </tbody></table></div>
+      </div>
+
+    </div>
+    <div class="todo">
+      <b>TODO (DeepSeek-V4-Flash-DSpark)</b><br>
+      1. Host 异步下发<br>
+      2. 算子持续优化<br>
+      3. 补齐长序列数据
+    </div>
+  </div>
+  <div class="foot"><div class="nav">进展汇报0914</div><div class="pg">2</div></div>
+</section>
+</div></div>
+
+<script>
+(function(){
+  var deck=document.getElementById('deck');
+  function fit(){
+    var pad=28, sw=(window.innerWidth-pad)/1333, sh=(window.innerHeight-pad)/750;
+    deck.style.transform='scale('+Math.min(sw,sh)+')';
+  }
+  window.addEventListener('resize',fit); fit();
+  var ss=[].slice.call(deck.querySelectorAll('.s')), i=0;
+  function go(n){
+    if(n<0||n>=ss.length)return;
+    ss[i].classList.remove('on'); i=n; ss[i].classList.add('on');
+  }
+  go(0);
+  document.addEventListener('keydown',function(e){
+    if(e.metaKey||e.ctrlKey||e.altKey)return;
+    var k=e.key;
+    if(k==='ArrowRight'||k==='PageDown'||k===' '){e.preventDefault();go(i+1)}
+    else if(k==='ArrowLeft'||k==='PageUp'){e.preventDefault();go(i-1)}
+    else if(k==='Home'){e.preventDefault();go(0)}
+    else if(k==='End'){e.preventDefault();go(ss.length-1)}
+  });
+  deck.addEventListener('click',function(e){
+    go(e.clientX < window.innerWidth*0.28 ? i-1 : i+1);
+  });
+})();
+</script>
+</body>
+</html>
