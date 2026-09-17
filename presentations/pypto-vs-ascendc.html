@@ -515,49 +515,55 @@
               </thead>
               <tbody>
                 <tr>
-                  <td class="perf-type" rowspan="6">
+                  <td class="perf-type" rowspan="7">
                     算子性能
-                    <span class="row-note">TP=1，DP=EP=16，GBS=16×4，SeqLen=8K，MTP=1，eplb</span>
+                    <span class="row-note">TP=1，DP=16，EP=16，LM Head TP=4，GBS=16×4，MTP=1，eplb，In=8K，Output=256</span>
                   </td>
                   <td class="metric">Attention CSA</td>
-                  <td>351 μs</td>
+                  <td>358 μs</td>
                   <td>465 μs</td>
-                  <td><span class="ratio-good">132.5%</span></td>
+                  <td><span class="ratio-good">129.9%</span></td>
                 </tr>
                 <tr>
                   <td class="metric">Attention HCA</td>
-                  <td>261 μs</td>
+                  <td>259 μs</td>
                   <td>307 μs</td>
-                  <td><span class="ratio-good">117.6%</span></td>
+                  <td><span class="ratio-good">118.5%</span></td>
                 </tr>
                 <tr>
                   <td class="metric">Attention SWA</td>
-                  <td>245 μs</td>
+                  <td>247 μs</td>
                   <td>280 μs</td>
-                  <td><span class="ratio-good">114.3%</span></td>
+                  <td><span class="ratio-good">113.4%</span></td>
                 </tr>
                 <tr>
                   <td class="metric">MoE</td>
-                  <td>474 μs</td>
+                  <td>450 μs</td>
                   <td>479 μs</td>
-                  <td><span class="ratio-good">101.1%</span></td>
+                  <td><span class="ratio-good">106.4%</span></td>
                 </tr>
                 <tr>
                   <td class="metric">Decode Main</td>
-                  <td>35.6 ms</td>
-                  <td>37.7 ms</td>
-                  <td><span class="ratio-good">105.9%</span></td>
+                  <td>33.2 ms</td>
+                  <td>37.6 ms</td>
+                  <td><span class="ratio-good">113.0%</span></td>
                 </tr>
                 <tr>
                   <td class="metric">Decode MTP</td>
-                  <td>1143 μs</td>
-                  <td>1268 μs</td>
-                  <td><span class="ratio-good">110.9%</span></td>
+                  <td>1089 μs</td>
+                  <td>1611 μs</td>
+                  <td><span class="ratio-good">147.9%</span></td>
+                </tr>
+                <tr>
+                  <td class="metric">Decode Total</td>
+                  <td>34.3 ms</td>
+                  <td>39.2 ms</td>
+                  <td><span class="ratio-good">114.1%</span></td>
                 </tr>
                 <tr>
                   <td class="perf-type" rowspan="2">
                     推理性能
-                    <span class="row-note">TP=1，DP=EP=8，LM Head TP=4，GBS=8×4，SeqLen=64，MTP=1，Output=256</span>
+                    <span class="row-note">TP=1，DP=8，EP=8，LM Head TP=4，GBS=8×4，MTP=1，In=64，Output=256</span>
                   </td>
                   <td class="metric">Decode Step (Host)</td>
                   <td>41.2 ms</td>
